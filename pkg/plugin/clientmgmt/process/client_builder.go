@@ -78,10 +78,9 @@ func (b *clientBuilder) clientConfig() *hcplugin.ClientConfig {
 			string(common.PluginKindRestoreItemAction):   framework.NewRestoreItemActionPlugin(common.ClientLogger(b.clientLogger)),
 			string(common.PluginKindRestoreItemActionV2): riav2.NewRestoreItemActionPlugin(common.ClientLogger(b.clientLogger)),
 			string(common.PluginKindDeleteItemAction):    framework.NewDeleteItemActionPlugin(common.ClientLogger(b.clientLogger)),
-			string(common.PluginKindItemSnapshotter):     framework.NewItemSnapshotterPlugin(common.ClientLogger(b.clientLogger)),
 		},
 		Logger: b.pluginLogger,
-		Cmd:    exec.Command(b.commandName, b.commandArgs...), //nolint
+		Cmd:    exec.Command(b.commandName, b.commandArgs...), //nolint:gosec // Internal call. No need to check the command line.
 	}
 }
 

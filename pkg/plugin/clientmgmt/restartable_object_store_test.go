@@ -17,7 +17,7 @@ limitations under the License.
 package clientmgmt
 
 import (
-	"io/ioutil"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +47,7 @@ func TestRestartableGetObjectStore(t *testing.T) {
 		{
 			name:          "wrong type",
 			plugin:        3,
-			expectedError: "int is not a ObjectStore!",
+			expectedError: "plugin int is not a ObjectStore",
 		},
 		{
 			name:   "happy path",
@@ -97,7 +97,7 @@ func TestRestartableObjectStoreReinitialize(t *testing.T) {
 	}
 
 	err := r.Reinitialize(3)
-	assert.EqualError(t, err, "int is not a ObjectStore!")
+	assert.EqualError(t, err, "plugin int is not a ObjectStore")
 
 	objectStore := new(providermocks.ObjectStore)
 	objectStore.Test(t)
@@ -208,7 +208,7 @@ func TestRestartableObjectStoreDelegatedFunctions(t *testing.T) {
 			Function:                "GetObject",
 			Inputs:                  []interface{}{"bucket", "key"},
 			ExpectedErrorOutputs:    []interface{}{nil, errors.Errorf("reset error")},
-			ExpectedDelegateOutputs: []interface{}{ioutil.NopCloser(strings.NewReader("object")), errors.Errorf("delegate error")},
+			ExpectedDelegateOutputs: []interface{}{io.NopCloser(strings.NewReader("object")), errors.Errorf("delegate error")},
 		},
 		restartabletest.RestartableDelegateTest{
 			Function:                "ListCommonPrefixes",

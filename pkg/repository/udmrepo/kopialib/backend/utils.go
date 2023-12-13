@@ -18,6 +18,7 @@ package backend
 
 import (
 	"context"
+	"encoding/base64"
 	"strconv"
 	"time"
 
@@ -28,9 +29,8 @@ import (
 func mustHaveString(key string, flags map[string]string) (string, error) {
 	if value, exist := flags[key]; exist {
 		return value, nil
-	} else {
-		return "", errors.New("key " + key + " not found")
 	}
+	return "", errors.New("key " + key + " not found")
 }
 
 func optionalHaveString(key string, flags map[string]string) string {
@@ -68,9 +68,8 @@ func optionalHaveFloat64(ctx context.Context, key string, flags map[string]strin
 func optionalHaveStringWithDefault(key string, flags map[string]string, defValue string) string {
 	if value, exist := flags[key]; exist {
 		return value
-	} else {
-		return defValue
 	}
+	return defValue
 }
 
 func optionalHaveDuration(ctx context.Context, key string, flags map[string]string) time.Duration {
@@ -84,6 +83,19 @@ func optionalHaveDuration(ctx context.Context, key string, flags map[string]stri
 	}
 
 	return 0
+}
+
+func optionalHaveBase64(ctx context.Context, key string, flags map[string]string) []byte {
+	if value, exist := flags[key]; exist {
+		ret, err := base64.StdEncoding.DecodeString(value)
+		if err == nil {
+			return ret
+		}
+
+		backendLog()(ctx).Errorf("Ignore %s, value [%s] is invalid, err %v", key, value, err)
+	}
+
+	return nil
 }
 
 func backendLog() func(ctx context.Context) logging.Logger {

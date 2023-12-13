@@ -255,17 +255,23 @@ For example, A Persistent Volume object has a reference to the Persistent Volume
 
 ## Restore existing resource policy
 
-By default, Velero is configured to be non-destructive during a restore. This means that it will never overwrite data that already exists in your cluster. When Velero attempts to create a resource during a restore, the resource being restored is compared to the existing resources on the target cluster by the Kubernetes API Server. If the resource already exists in the target cluster, Velero skips restoring the current resource and moves onto the next resource to restore, without making any changes to the target cluster.
+By default, Velero is configured to be non-destructive during a restore. This means that it will never overwrite data that already exists in your cluster. When Velero attempts to create a resource during a restore, the resource being restored is compared to the existing resources on the target cluster. If the resource already exists in the target cluster, Velero skips restoring the current resource and moves onto the next resource to restore, without making any changes to the target cluster.
 
 An exception to the default restore policy is ServiceAccounts. When restoring a ServiceAccount that already exists on the target cluster, Velero will attempt to merge the fields of the ServiceAccount from the backup into the existing ServiceAccount. Secrets and ImagePullSecrets are appended from the backed-up ServiceAccount. Velero adds any non-existing labels and annotations from the backed-up ServiceAccount to the existing resource, leaving the existing labels and annotations in place.
 
-You can change this policy for a restore by using the `--existing-resource-policy` restore flag. The available options are `none` (default) and `update`. If you choose to `update` existing resources during a restore (`--existing-resource-policy=update`), Velero will attempt to update an existing resource to match the resource being restored:
+You can change this policy for a restore by using the `--existing-resource-policy` restore flag. The available options
+are `none` (default) and `update`. If you choose to update existing resources during a restore
+(`--existing-resource-policy=update`), Velero will attempt to update an existing resource to match the resource from the backup: 
 
 * If the existing resource in the target cluster is the same as the resource Velero is attempting to restore, Velero will add a `velero.io/backup-name` label with the backup name and a `velero.io/restore-name` label with the restore name to the existing resource. If patching the labels fails, Velero adds a restore error and continues restoring the next resource.
 
 * If the existing resource in the target cluster is different from the backup, Velero will first try to patch the existing resource to match the backup resource. If the patch is successful, Velero will add a `velero.io/backup-name` label with the backup name and a `velero.io/restore-name` label with the restore name to the existing resource. If the patch fails, Velero adds a restore warning and tries to add the `velero.io/backup-name` and `velero.io/restore-name` labels on the resource. If the labels patch also fails, then Velero logs a restore error and continues restoring the next resource.
 
 You can also configure the existing resource policy in a [Restore](api-types/restore.md) object.
+
+**NOTE:** 
+* Update of a resource only applies to the Kubernetes resource data such as its spec. It may not work as expected for certain resource types such as PVCs and Pods. In case of PVCs for example, data in the PV is not restored or overwritten in any way.
+* `update` existing resource policy works in a best-effort way, which means when restore's `--existing-resource-policy` is set to `update`, Velero will try to update the resource if the resource already exists, if the update fails, Velero will fall back to the default non-destructive way in the restore, and just logs a warning without failing the restore.
 
 ## Removing a Restore object
 
@@ -274,21 +280,23 @@ There are two ways to delete a Restore object:
 1. Deleting with `velero restore delete` will delete the Custom Resource representing the restore, along with its individual log and results files. It will not delete any objects that were created by the restore in your cluster.
 2. Deleting with `kubectl -n velero delete restore` will delete the Custom Resource representing the restore. It will not delete restore log or results files from object storage, or any objects that were created during the restore in your cluster.
 
-## What happens to NodePorts when restoring Services
+## What happens to NodePorts and HealthCheckNodePort when restoring Services
 
-During a restore, Velero deletes **Auto assigned** NodePorts by default and Services get new **auto assigned** nodePorts after restore.
+During a restore, Velero deletes **Auto assigned** NodePorts and HealthCheckNodePort by default and Services get new **auto assigned** nodePorts and healthCheckNodePort after restore.
 
-Velero auto detects **explicitly specified** NodePorts using **`last-applied-config`** annotation and they are **preserved** after restore. NodePorts can be explicitly specified as `.spec.ports[*].nodePort` field on Service definition.
+Velero auto detects **explicitly specified** NodePorts using **`last-applied-config`** annotation and **`managedFields`**. They are **preserved** after restore. NodePorts can be explicitly specified as `.spec.ports[*].nodePort` field on Service definition.
 
-### Always Preserve NodePorts
+Velero will do the same to the `HealthCheckNodePort` as `NodePorts`.
 
-It is not always possible to set nodePorts explicitly on some big clusters because of operational complexity. As the Kubernetes [NodePort documentation](https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport) states, "if you want a specific port number, you can specify a value in the `nodePort` field. The control plane will either allocate you that port or report that the API transaction failed. This means that you need to take care of possible port collisions yourself. You also have to use a valid port number, one that's inside the range configured for NodePort use.""
+### Always Preserve NodePorts and HealthCheckNodePort
+
+It is not always possible to set nodePorts and healthCheckNodePort explicitly on some big clusters because of operational complexity. As the Kubernetes [NodePort documentation](https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport) states, "if you want a specific port number, you can specify a value in the `nodePort` field. The control plane will either allocate you that port or report that the API transaction failed. This means that you need to take care of possible port collisions yourself. You also have to use a valid port number, one that's inside the range configured for NodePort use.""
 
 The clusters which are not explicitly specifying nodePorts may still need to restore original NodePorts in the event of a disaster. Auto assigned nodePorts are typically defined on Load Balancers located in front of cluster. Changing all these nodePorts on Load Balancers is another operation complexity you are responsible for updating after disaster if nodePorts are changed.
 
-Use the `velero restore create ` command's `--preserve-nodeports` flag to preserve Service nodePorts always, regardless of whether nodePorts are explicitly specified or not. This flag is used for preserving the original nodePorts from a backup and can be used as `--preserve-nodeports` or `--preserve-nodeports=true`. If this flag is present, Velero will not remove the nodePorts when restoring a Service, but will try to use the nodePorts from the backup.
+Use the `velero restore create ` command's `--preserve-nodeports` flag to preserve Service nodePorts and healthCheckNodePort always, regardless of whether nodePorts are explicitly specified or not. This flag is used for preserving the original nodePorts and healthCheckNodePort from a backup and can be used as `--preserve-nodeports` or `--preserve-nodeports=true`. If this flag is present, Velero will not remove the nodePorts and healthCheckNodePort when restoring a Service, but will try to use the nodePorts from the backup.
 
-Trying to preserve nodePorts may cause port conflicts when restoring on situations below:
+Trying to preserve nodePorts and healthCheckNodePort may cause port conflicts when restoring on situations below:
 
 - If the nodePort from the backup is already allocated on the target cluster then Velero prints error log as shown below and continues the restore operation.
 

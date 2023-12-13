@@ -12,19 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=linux/amd64 golang:1.18
+FROM --platform=linux/amd64 golang:1.21-bookworm
 
 ARG GOPROXY
 
 ENV GO111MODULE=on
 # Use a proxy for go modules to reduce the likelihood of various hosts being down and breaking the build
 ENV GOPROXY=${GOPROXY}
-
-# get code-generation tools (for now keep in GOPATH since they're not fully modules-compatible yet)
-RUN mkdir -p /go/src/k8s.io
-WORKDIR /go/src/k8s.io
-RUN git config --global advice.detachedHead false
-RUN git clone -b v0.22.2 https://github.com/kubernetes/code-generator
 
 # kubebuilder test bundle is separated from kubebuilder. Need to setup it for CI test.
 RUN curl -sSLo envtest-bins.tar.gz https://go.kubebuilder.io/test-tools/1.22.1/linux/amd64 && \
@@ -36,7 +30,7 @@ RUN wget --quiet https://github.com/kubernetes-sigs/kubebuilder/releases/downloa
     chmod +x /usr/local/kubebuilder/bin/kubebuilder
 
 # get controller-tools
-RUN go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.7.0
+RUN go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.12.0
 
 # get goimports (the revision is pinned so we don't indiscriminately update, but the particular commit
 # is not important)
@@ -56,13 +50,13 @@ RUN wget --quiet https://github.com/protocolbuffers/protobuf/releases/download/v
 RUN go install github.com/golang/protobuf/protoc-gen-go@v1.4.3
 
 # get goreleaser
-RUN wget --quiet https://github.com/goreleaser/goreleaser/releases/download/v1.12.3/goreleaser_Linux_x86_64.tar.gz && \
+RUN wget --quiet https://github.com/goreleaser/goreleaser/releases/download/v1.15.2/goreleaser_Linux_x86_64.tar.gz && \
     tar xvf goreleaser_Linux_x86_64.tar.gz && \
     mv goreleaser /usr/bin/goreleaser && \
     chmod +x /usr/bin/goreleaser
 
 # get golangci-lint
-RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.45.0
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.54.2
 
 # install kubectl
 RUN curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl

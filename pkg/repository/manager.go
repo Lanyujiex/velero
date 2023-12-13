@@ -36,18 +36,18 @@ import (
 type SnapshotIdentifier struct {
 	// VolumeNamespace is the namespace of the pod/volume that
 	// the snapshot is for.
-	VolumeNamespace string
+	VolumeNamespace string `json:"volumeNamespace"`
 
 	// BackupStorageLocation is the backup's storage location
 	// name.
-	BackupStorageLocation string
+	BackupStorageLocation string `json:"backupStorageLocation"`
 
 	// SnapshotID is the short ID of the snapshot.
-	SnapshotID string
+	SnapshotID string `json:"snapshotID"`
 
 	// RepositoryType is the type of the repository where the
 	// snapshot is stored
-	RepositoryType string
+	RepositoryType string `json:"repositoryType"`
 }
 
 // Manager manages backup repositories.
@@ -81,7 +81,7 @@ type manager struct {
 	providers   map[string]provider.Provider
 	client      client.Client
 	repoLocker  *RepoLocker
-	repoEnsurer *RepositoryEnsurer
+	repoEnsurer *Ensurer
 	fileSystem  filesystem.Interface
 	log         logrus.FieldLogger
 }
@@ -91,7 +91,7 @@ func NewManager(
 	namespace string,
 	client client.Client,
 	repoLocker *RepoLocker,
-	repoEnsurer *RepositoryEnsurer,
+	repoEnsurer *Ensurer,
 	credentialFileStore credentials.FileStore,
 	credentialSecretStore credentials.SecretStore,
 	log logrus.FieldLogger,
@@ -247,7 +247,7 @@ func (m *manager) getRepositoryProvider(repo *velerov1api.BackupRepository) (pro
 
 func (m *manager) assembleRepoParam(repo *velerov1api.BackupRepository) (provider.RepoParam, error) {
 	bsl := &velerov1api.BackupStorageLocation{}
-	if err := m.client.Get(context.Background(), client.ObjectKey{m.namespace, repo.Spec.BackupStorageLocation}, bsl); err != nil {
+	if err := m.client.Get(context.Background(), client.ObjectKey{Namespace: m.namespace, Name: repo.Spec.BackupStorageLocation}, bsl); err != nil {
 		return provider.RepoParam{}, errors.WithStack(err)
 	}
 	return provider.RepoParam{

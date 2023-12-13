@@ -1,0 +1,170 @@
+/*
+Copyright The Velero Contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package resourcepolicies
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/pkg/errors"
+	v1 "k8s.io/api/core/v1"
+)
+
+type VolumeActionType string
+
+const (
+	// currently only support configmap type of resource config
+	ConfigmapRefType string           = "configmap"
+	Skip             VolumeActionType = "skip"
+)
+
+// Action defined as one action for a specific way of backup
+type Action struct {
+	// Type defined specific type of action, currently only support 'skip'
+	Type VolumeActionType `yaml:"type"`
+	// Parameters defined map of parameters when executing a specific action
+	Parameters map[string]interface{} `yaml:"parameters,omitempty"`
+}
+
+// volumePolicy defined policy to conditions to match Volumes and related action to handle matched Volumes
+type volumePolicy struct {
+	// Conditions defined list of conditions to match Volumes
+	Conditions map[string]interface{} `yaml:"conditions"`
+	Action     Action                 `yaml:"action"`
+}
+
+// resourcePolicies currently defined slice of volume policies to handle backup
+type resourcePolicies struct {
+	Version        string         `yaml:"version"`
+	VolumePolicies []volumePolicy `yaml:"volumePolicies"`
+	// we may support other resource policies in the future, and they could be added separately
+	// OtherResourcePolicies []OtherResourcePolicy
+}
+
+type Policies struct {
+	version        string
+	volumePolicies []volPolicy
+	// OtherPolicies
+}
+
+func unmarshalResourcePolicies(yamlData *string) (*resourcePolicies, error) {
+	resPolicies := &resourcePolicies{}
+	err := decodeStruct(strings.NewReader(*yamlData), resPolicies)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode yaml data into resource policies  %v", err)
+	}
+	return resPolicies, nil
+}
+
+func (p *Policies) buildPolicy(resPolicies *resourcePolicies) error {
+	for _, vp := range resPolicies.VolumePolicies {
+		con, err := unmarshalVolConditions(vp.Conditions)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		volCap, err := parseCapacity(con.Capacity)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		var volP volPolicy
+		volP.action = vp.Action
+		volP.conditions = append(volP.conditions, &capacityCondition{capacity: *volCap})
+		volP.conditions = append(volP.conditions, &storageClassCondition{storageClass: con.StorageClass})
+		volP.conditions = append(volP.conditions, &nfsCondition{nfs: con.NFS})
+		volP.conditions = append(volP.conditions, &csiCondition{csi: con.CSI})
+		volP.conditions = append(volP.conditions, &volumeTypeCondition{volumeTypes: con.VolumeTypes})
+		p.volumePolicies = append(p.volumePolicies, volP)
+	}
+
+	// Other resource policies
+
+	p.version = resPolicies.Version
+	return nil
+}
+
+func (p *Policies) match(res *structuredVolume) *Action {
+	for _, policy := range p.volumePolicies {
+		isAllMatch := false
+		for _, con := range policy.conditions {
+			if !con.match(res) {
+				isAllMatch = false
+				break
+			}
+			isAllMatch = true
+		}
+		if isAllMatch {
+			return &policy.action
+		}
+	}
+	return nil
+}
+
+func (p *Policies) GetMatchAction(res interface{}) (*Action, error) {
+	volume := &structuredVolume{}
+	switch obj := res.(type) {
+	case *v1.PersistentVolume:
+		volume.parsePV(obj)
+	case *v1.Volume:
+		volume.parsePodVolume(obj)
+	default:
+		return nil, errors.New("failed to convert object")
+	}
+	return p.match(volume), nil
+}
+
+func (p *Policies) Validate() error {
+	if p.version != currentSupportDataVersion {
+		return fmt.Errorf("incompatible version number %s with supported version %s", p.version, currentSupportDataVersion)
+	}
+
+	for _, policy := range p.volumePolicies {
+		if err := policy.action.validate(); err != nil {
+			return errors.WithStack(err)
+		}
+		for _, con := range policy.conditions {
+			if err := con.validate(); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+	}
+	return nil
+}
+
+func GetResourcePoliciesFromConfig(cm *v1.ConfigMap) (*Policies, error) {
+	if cm == nil {
+		return nil, fmt.Errorf("could not parse config from nil configmap")
+	}
+	if len(cm.Data) != 1 {
+		return nil, fmt.Errorf("illegal resource policies %s/%s configmap", cm.Namespace, cm.Name)
+	}
+
+	var yamlData string
+	for _, v := range cm.Data {
+		yamlData = v
+	}
+
+	resPolicies, err := unmarshalResourcePolicies(&yamlData)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	policies := &Policies{}
+	if err := policies.buildPolicy(resPolicies); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return policies, nil
+}

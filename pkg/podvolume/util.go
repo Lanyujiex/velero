@@ -37,14 +37,6 @@ const (
 	// TODO(2.0): remove
 	podAnnotationPrefix = "snapshot.velero.io/"
 
-	// VolumesToBackupAnnotation is the annotation on a pod whose mounted volumes
-	// need to be backed up using pod volume backup.
-	VolumesToBackupAnnotation = "backup.velero.io/backup-volumes"
-
-	// VolumesToExcludeAnnotation is the annotation on a pod whose mounted volumes
-	// should be excluded from pod volume backup.
-	VolumesToExcludeAnnotation = "backup.velero.io/backup-volumes-excludes"
-
 	// DefaultVolumesToFsBackup specifies whether pod volume backup should be used, by default, to
 	// take backup of all pod volumes.
 	DefaultVolumesToFsBackup = false
@@ -151,9 +143,8 @@ func GetSnapshotIdentifier(podVolumeBackups *velerov1api.PodVolumeBackupList) []
 func getUploaderTypeOrDefault(uploaderType string) string {
 	if uploaderType != "" {
 		return uploaderType
-	} else {
-		return uploader.ResticType
 	}
+	return uploader.ResticType
 }
 
 // getRepositoryType returns the hardcode repositoryType for different backup methods - Restic or Kopia,uploaderType
@@ -216,82 +207,4 @@ func getPodSnapshotAnnotations(obj metav1.Object) map[string]string {
 	}
 
 	return res
-}
-
-// GetVolumesToBackup returns a list of volume names to backup for
-// the provided pod.
-// Deprecated: Use GetVolumesByPod instead.
-func GetVolumesToBackup(obj metav1.Object) []string {
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		return nil
-	}
-
-	backupsValue := annotations[VolumesToBackupAnnotation]
-	if backupsValue == "" {
-		return nil
-	}
-
-	return strings.Split(backupsValue, ",")
-}
-
-func getVolumesToExclude(obj metav1.Object) []string {
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		return nil
-	}
-
-	return strings.Split(annotations[VolumesToExcludeAnnotation], ",")
-}
-
-func contains(list []string, k string) bool {
-	for _, i := range list {
-		if i == k {
-			return true
-		}
-	}
-	return false
-}
-
-// GetVolumesByPod returns a list of volume names to backup for the provided pod.
-func GetVolumesByPod(pod *corev1api.Pod, defaultVolumesToFsBackup bool) []string {
-	if !defaultVolumesToFsBackup {
-		return GetVolumesToBackup(pod)
-	}
-
-	volsToExclude := getVolumesToExclude(pod)
-	podVolumes := []string{}
-	for _, pv := range pod.Spec.Volumes {
-		// cannot backup hostpath volumes as they are not mounted into /var/lib/kubelet/pods
-		// and therefore not accessible to the node agent daemon set.
-		if pv.HostPath != nil {
-			continue
-		}
-		// don't backup volumes mounting secrets. Secrets will be backed up separately.
-		if pv.Secret != nil {
-			continue
-		}
-		// don't backup volumes mounting config maps. Config maps will be backed up separately.
-		if pv.ConfigMap != nil {
-			continue
-		}
-		// don't backup volumes mounted as projected volumes, all data in those come from kube state.
-		if pv.Projected != nil {
-			continue
-		}
-		// don't backup DownwardAPI volumes, all data in those come from kube state.
-		if pv.DownwardAPI != nil {
-			continue
-		}
-		// don't backup volumes that are included in the exclude list.
-		if contains(volsToExclude, pv.Name) {
-			continue
-		}
-		// don't include volumes that mount the default service account token.
-		if strings.HasPrefix(pv.Name, "default-token") {
-			continue
-		}
-		podVolumes = append(podVolumes, pv.Name)
-	}
-	return podVolumes
 }

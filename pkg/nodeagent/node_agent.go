@@ -18,31 +18,55 @@ package nodeagent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/pkg/errors"
-	"k8s.io/client-go/kubernetes"
-
-	"github.com/vmware-tanzu/velero/pkg/util/kube"
-
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 const (
 	// daemonSet is the name of the Velero node agent daemonset.
-	daemonSet = "node-agent"
+	daemonSet  = "node-agent"
+	configName = "node-agent-configs"
 )
 
 var (
-	DaemonsetNotFound = errors.New("daemonset not found")
+	ErrDaemonSetNotFound = errors.New("daemonset not found")
 )
+
+type LoadConcurrency struct {
+	// GlobalConfig specifies the concurrency number to all nodes for which per-node config is not specified
+	GlobalConfig int `json:"globalConfig,omitempty"`
+
+	// PerNodeConfig specifies the concurrency number to nodes matched by rules
+	PerNodeConfig []RuledConfigs `json:"perNodeConfig,omitempty"`
+}
+
+type RuledConfigs struct {
+	// NodeSelector specifies the label selector to match nodes
+	NodeSelector metav1.LabelSelector `json:"nodeSelector"`
+
+	// Number specifies the number value associated to the matched nodes
+	Number int `json:"number"`
+}
+
+type Configs struct {
+	// LoadConcurrency is the config for data path load concurrency per node.
+	LoadConcurrency *LoadConcurrency `json:"loadConcurrency,omitempty"`
+}
 
 // IsRunning checks if the node agent daemonset is running properly. If not, return the error found
 func IsRunning(ctx context.Context, kubeClient kubernetes.Interface, namespace string) error {
 	if _, err := kubeClient.AppsV1().DaemonSets(namespace).Get(ctx, daemonSet, metav1.GetOptions{}); apierrors.IsNotFound(err) {
-		return DaemonsetNotFound
+		return ErrDaemonSetNotFound
 	} else if err != nil {
 		return err
 	} else {
@@ -51,12 +75,18 @@ func IsRunning(ctx context.Context, kubeClient kubernetes.Interface, namespace s
 }
 
 // IsRunningInNode checks if the node agent pod is running properly in a specified node. If not, return the error found
-func IsRunningInNode(ctx context.Context, namespace string, nodeName string, podClient corev1client.PodsGetter) error {
+func IsRunningInNode(ctx context.Context, namespace string, nodeName string, crClient ctrlclient.Client) error {
 	if nodeName == "" {
 		return errors.New("node name is empty")
 	}
 
-	pods, err := podClient.Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("name=%s", daemonSet)})
+	pods := new(v1.PodList)
+	parsedSelector, err := labels.Parse(fmt.Sprintf("name=%s", daemonSet))
+	if err != nil {
+		return errors.Wrap(err, "fail to parse selector")
+	}
+
+	err = crClient.List(ctx, pods, &ctrlclient.ListOptions{LabelSelector: parsedSelector})
 	if err != nil {
 		return errors.Wrap(err, "failed to list daemonset pods")
 	}
@@ -72,4 +102,41 @@ func IsRunningInNode(ctx context.Context, namespace string, nodeName string, pod
 	}
 
 	return errors.Errorf("daemonset pod not found in running state in node %s", nodeName)
+}
+
+func GetPodSpec(ctx context.Context, kubeClient kubernetes.Interface, namespace string) (*v1.PodSpec, error) {
+	ds, err := kubeClient.AppsV1().DaemonSets(namespace).Get(ctx, daemonSet, metav1.GetOptions{})
+	if err != nil {
+		return nil, errors.Wrap(err, "error to get node-agent daemonset")
+	}
+
+	return &ds.Spec.Template.Spec, nil
+}
+
+func GetConfigs(ctx context.Context, namespace string, kubeClient kubernetes.Interface) (*Configs, error) {
+	cm, err := kubeClient.CoreV1().ConfigMaps(namespace).Get(ctx, configName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		} else {
+			return nil, errors.Wrapf(err, "error to get node agent configs %s", configName)
+		}
+	}
+
+	if cm.Data == nil {
+		return nil, errors.Errorf("data is not available in config map %s", configName)
+	}
+
+	jsonString := ""
+	for _, v := range cm.Data {
+		jsonString = v
+	}
+
+	configs := &Configs{}
+	err = json.Unmarshal([]byte(jsonString), configs)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error to unmarshall configs from %s", configName)
+	}
+
+	return configs, nil
 }

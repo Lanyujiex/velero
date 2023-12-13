@@ -46,11 +46,19 @@ kubectl edit deployment/velero -n velero
 ...
 ```
 
+**Note:** Velero plugins are started as separate processes and once the Velero operation is done (either successfully or not), they exit. So, if you see **received EOF, stopping recv loop** messages in debug logs, that does not mean an error occurred, just that a plugin finished executing.
+
 ## Known issue with restoring LoadBalancer Service
 
 Because of how Kubernetes handles Service objects of `type=LoadBalancer`, when you restore these objects you might encounter an issue with changed values for Service UIDs. Kubernetes automatically generates the name of the cloud resource based on the Service UID, which is different when restored, resulting in a different name for the cloud load balancer. If the DNS CNAME for your application points to the DNS name of your cloud load balancer, you'll need to update the CNAME pointer when you perform a Velero restore.
 
 Alternatively, you might be able to use the Service's `spec.loadBalancerIP` field to keep connections valid, if your cloud provider supports this value. See [the Kubernetes documentation about Services of Type LoadBalancer](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer).
+
+## Known issue with restoring resources when Admission webhooks are enabled
+
+The [Admission webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/) may forbid a resource to be created based on the input, it may optionally mutate the input as well.  
+Because velero calls the API server to restore resources, it is possible that the admission webhooks are invoked and cause unexpected failures, depending on the implementation and the configuration of the webhooks.
+To work around such issue, you may disable the webhooks or create a restore item action plugin to modify the resources before they are restored. 
 
 ## Miscellaneous issues
 
@@ -223,7 +231,7 @@ Follow the below troubleshooting steps to confirm that Velero is using the corre
 [6]: https://github.com/vmware-tanzu/helm-charts/blob/main/charts/velero
 [7]: https://github.com/vmware-tanzu/helm-charts/blob/main/charts/velero/values.yaml#L44
 [8]: https://github.com/vmware-tanzu/helm-charts/blob/main/charts/velero/values.yaml#L49-L52
-[9]: https://kubectl.docs.kubernetes.io/pages/container_debugging/port_forward_to_pods.html
+[9]: https://kubernetes.io/docs/reference/generated/kubectl/kubectl-commands#port-forward
 [10]: locations.md
 [11]: /plugins
 [12]: https://kubernetes.io/docs/concepts/configuration/secret/#editing-a-secret

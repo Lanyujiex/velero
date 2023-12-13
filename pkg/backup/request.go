@@ -20,10 +20,11 @@ import (
 	"fmt"
 	"sort"
 
-	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
-
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
+	internalVolume "github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/plugin/framework"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
 	"github.com/vmware-tanzu/velero/pkg/volume"
@@ -43,14 +44,28 @@ type Request struct {
 	StorageLocation           *velerov1api.BackupStorageLocation
 	SnapshotLocations         []*velerov1api.VolumeSnapshotLocation
 	NamespaceIncludesExcludes *collections.IncludesExcludes
-	ResourceIncludesExcludes  *collections.IncludesExcludes
+	ResourceIncludesExcludes  collections.IncludesExcludesInterface
 	ResourceHooks             []hook.ResourceHook
 	ResolvedActions           []framework.BackupItemResolvedActionV2
-	ResolvedItemSnapshotters  []framework.ItemSnapshotterResolvedAction
 	VolumeSnapshots           []*volume.Snapshot
 	PodVolumeBackups          []*velerov1api.PodVolumeBackup
 	BackedUpItems             map[itemKey]struct{}
-	CSISnapshots              []snapshotv1api.VolumeSnapshot
+	itemOperationsList        *[]*itemoperation.BackupOperation
+	ResPolicies               *resourcepolicies.Policies
+	SkippedPVTracker          *skipPVTracker
+	VolumesInformation        internalVolume.VolumesInformation
+}
+
+// VolumesInformation contains the information needs by generating
+// the backup VolumeInfo array.
+
+// GetItemOperationsList returns ItemOperationsList, initializing it if necessary
+func (r *Request) GetItemOperationsList() *[]*itemoperation.BackupOperation {
+	if r.itemOperationsList == nil {
+		list := []*itemoperation.BackupOperation{}
+		r.itemOperationsList = &list
+	}
+	return r.itemOperationsList
 }
 
 // BackupResourceList returns the list of backed up resources grouped by the API
@@ -71,4 +86,18 @@ func (r *Request) BackupResourceList() map[string][]string {
 	}
 
 	return resources
+}
+
+func (r *Request) FillVolumesInformation() {
+	skippedPVMap := make(map[string]string)
+
+	for _, skippedPV := range r.SkippedPVTracker.Summary() {
+		skippedPVMap[skippedPV.Name] = skippedPV.SerializeSkipReasons()
+	}
+
+	r.VolumesInformation.SkippedPVs = skippedPVMap
+	r.VolumesInformation.NativeSnapshots = r.VolumeSnapshots
+	r.VolumesInformation.PodVolumeBackups = r.PodVolumeBackups
+	r.VolumesInformation.BackupOperations = *r.GetItemOperationsList()
+	r.VolumesInformation.BackupName = r.Backup.Name
 }

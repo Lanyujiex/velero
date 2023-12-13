@@ -40,7 +40,6 @@ func DaemonSet(namespace string, opts ...podTemplateOption) *appsv1.DaemonSet {
 	imageParts := strings.Split(c.image, ":")
 	if len(imageParts) == 2 && imageParts[1] != "latest" {
 		pullPolicy = corev1.PullIfNotPresent
-
 	}
 
 	daemonSetArgs := []string{
@@ -88,6 +87,14 @@ func DaemonSet(namespace string, opts ...podTemplateOption) *appsv1.DaemonSet {
 							},
 						},
 						{
+							Name: "host-plugins",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: "/var/lib/kubelet/plugins",
+								},
+							},
+						},
+						{
 							Name: "scratch",
 							VolumeSource: corev1.VolumeSource{
 								EmptyDir: new(corev1.EmptyDirVolumeSource),
@@ -98,16 +105,24 @@ func DaemonSet(namespace string, opts ...podTemplateOption) *appsv1.DaemonSet {
 						{
 							Name:            "node-agent",
 							Image:           c.image,
+							Ports:           containerPorts(),
 							ImagePullPolicy: pullPolicy,
 							Command: []string{
 								"/velero",
 							},
 							Args: daemonSetArgs,
-
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: &c.privilegedNodeAgent,
+							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:             "host-pods",
 									MountPath:        "/host_pods",
+									MountPropagation: &mountPropagationMode,
+								},
+								{
+									Name:             "host-plugins",
+									MountPath:        "/var/lib/kubelet/plugins",
 									MountPropagation: &mountPropagationMode,
 								},
 								{

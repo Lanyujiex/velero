@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,12 +27,12 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	. "github.com/vmware-tanzu/velero/test/e2e"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/k8s"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/kibishii"
+	. "github.com/vmware-tanzu/velero/test"
+	. "github.com/vmware-tanzu/velero/test/util/k8s"
+	. "github.com/vmware-tanzu/velero/test/util/kibishii"
 
-	. "github.com/vmware-tanzu/velero/test/e2e/util/providers"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/velero"
+	. "github.com/vmware-tanzu/velero/test/util/providers"
+	. "github.com/vmware-tanzu/velero/test/util/velero"
 )
 
 const (
@@ -70,32 +70,27 @@ func BslDeletionTest(useVolumeSnapshots bool) {
 		UUIDgen, err = uuid.NewRandom()
 		Expect(err).To(Succeed())
 		if veleroCfg.InstallVelero {
-			Expect(VeleroInstall(context.Background(), &veleroCfg)).To(Succeed())
+			Expect(PrepareVelero(context.Background(), "BSL Deletion")).To(Succeed())
 		}
 	})
 
 	AfterEach(func() {
 		if !veleroCfg.Debug {
 			By("Clean backups after test", func() {
-				DeleteBackups(context.Background(), *veleroCfg.DefaultClient)
+				DeleteAllBackups(context.Background(), *veleroCfg.DefaultClient)
 			})
 			By(fmt.Sprintf("Delete sample workload namespace %s", bslDeletionTestNs), func() {
 				Expect(DeleteNamespace(context.Background(), *veleroCfg.ClientToInstallVelero, bslDeletionTestNs,
 					true)).To(Succeed(), fmt.Sprintf("failed to delete the namespace %q",
 					bslDeletionTestNs))
 			})
-			if veleroCfg.InstallVelero {
-				By("Uninstall Velero", func() {
-					Expect(VeleroUninstall(context.Background(), veleroCfg.VeleroCLI,
-						veleroCfg.VeleroNamespace)).To(Succeed())
-				})
-			}
 		}
-
 	})
 
 	When("kibishii is the sample workload", func() {
 		It("Local backups and restic repos (if Velero was installed with Restic) will be deleted once the corresponding backup storage location is deleted", func() {
+			oneHourTimeout, ctxCancel := context.WithTimeout(context.Background(), time.Minute*60)
+			defer ctxCancel()
 			if veleroCfg.AdditionalBSLProvider == "" {
 				Skip("no additional BSL provider given, not running multiple BackupStorageLocation with unique credentials tests")
 			}
@@ -109,9 +104,7 @@ func BslDeletionTest(useVolumeSnapshots bool) {
 			}
 
 			By(fmt.Sprintf("Add an additional plugin for provider %s", veleroCfg.AdditionalBSLProvider), func() {
-				Expect(VeleroAddPluginsForProvider(context.TODO(), veleroCfg.VeleroCLI,
-					veleroCfg.VeleroNamespace, veleroCfg.AdditionalBSLProvider,
-					veleroCfg.AddBSLPlugins, veleroCfg.Features)).To(Succeed())
+				Expect(VeleroAddPluginsForProvider(context.TODO(), veleroCfg.VeleroCLI, veleroCfg.VeleroNamespace, veleroCfg.AdditionalBSLProvider, veleroCfg.AddBSLPlugins)).To(Succeed())
 			})
 
 			additionalBsl := fmt.Sprintf("bsl-%s", UUIDgen)
@@ -141,8 +134,6 @@ func BslDeletionTest(useVolumeSnapshots bool) {
 
 			backupName_1 := "backup1-" + UUIDgen.String()
 			backupName_2 := "backup2-" + UUIDgen.String()
-			oneHourTimeout, _ := context.WithTimeout(context.Background(), time.Minute*60)
-
 			backupLocation_1 := "default"
 			backupLocation_2 := additionalBsl
 			podName_1 := "kibishii-deployment-0"
@@ -168,13 +159,13 @@ func BslDeletionTest(useVolumeSnapshots bool) {
 				Expect(AddLabelToPod(context.Background(), "kibishii-deployment-1", bslDeletionTestNs, label_2)).To(Succeed())
 			})
 
-			By("Get all 2 PVCs of Kibishii and label them seprately ", func() {
-				pvc, err := GetPvcByPodName(context.Background(), bslDeletionTestNs, podName_1)
+			By("Get all 2 PVCs of Kibishii and label them separately ", func() {
+				pvc, err := GetPvcByPVCName(context.Background(), bslDeletionTestNs, podName_1)
 				Expect(err).To(Succeed())
 				fmt.Println(pvc)
 				Expect(len(pvc)).To(Equal(1))
 				pvc1 := pvc[0]
-				pvc, err = GetPvcByPodName(context.Background(), bslDeletionTestNs, podName_2)
+				pvc, err = GetPvcByPVCName(context.Background(), bslDeletionTestNs, podName_2)
 				Expect(err).To(Succeed())
 				fmt.Println(pvc)
 				Expect(len(pvc)).To(Equal(1))

@@ -3,6 +3,7 @@
 If you're using Velero and want to add your organization to this list, 
 [follow these directions][1]!
 
+<a href="https://www.pitsdatarecovery.net/" border="0" target="_blank"><img alt="pitsdatarecovery.net" src="site/static/img/adopters/PITSGlobalDataRecoveryServices.svg" height="50"></a>
 <a href="https://www.bitgo.com" border="0" target="_blank"><img alt="bitgo.com" src="site/static/img/adopters/BitGo.svg" height="50"></a>&nbsp; &nbsp; &nbsp;
 <a href="https://www.nirmata.com" border="0" target="_blank"><img alt="nirmata.com" src="site/static/img/adopters/nirmata.svg" height="50"></a>&nbsp; &nbsp; &nbsp;
 <a href="https://kyma-project.io/" border="0" target="_blank"><img alt="kyma-project.io" src="site/static/img/adopters/kyma.svg" height="50"></a>&nbsp; &nbsp; &nbsp;
@@ -21,10 +22,10 @@ Below is a list of adopters of Velero in **production environments** that have
 publicly shared the details of how they use it.
 
 **[BitGo][20]**  
-BitGo uses Velero backup and restore capabilities to seamlessly provision and scale fullnode statefulsets on the fly as well as having it serve an integral piece for our kubernetes disaster-recovery story.
+BitGo uses Velero backup and restore capabilities to seamlessly provision and scale fullnode statefulsets on the fly as well as having it serve an integral piece for our Kubernetes disaster-recovery story.
 
 **[Bugsnag][30]**  
-We use Velero for managing backups of an internal instance of our on-premise clustered solution. We also recommend our users of [on-premise Bugsnag installations][31] use Velero for [managing their own backups][32].
+We use Velero for managing backups of an internal instance of our on-premise clustered solution. We also recommend our users of [on-premise Bugsnag installations](https://www.bugsnag.com/on-premise) use Velero for [managing their own backups](https://docs.bugsnag.com/on-premise/clustered/backup-restore/). <!-- Velero.io word list : ignore -->
 
 **[Banzai Cloud][60]**  
 [Banzai Cloud Pipeline][61] is a Kubernetes-based microservices platform that integrates services needed for Day-1 and Day-2 operations along with first-class support both for on-prem and hybrid multi-cloud deployments. We use Velero to periodically [backup and restore these clusters in case of disasters][62].
@@ -82,8 +83,6 @@ If you would like to add your logo to a future `Adopters of Velero` section on [
 [20]: https://bitgo.com
 
 [30]: https://bugsnag.com
-[31]: https://www.bugsnag.com/on-premise
-[32]: https://docs.bugsnag.com/on-premise/clustered/backup-restore/
 
 [40]: https://kyma-project.io
 [41]: https://kyma-project.io/docs/components/backup/#overview-overview

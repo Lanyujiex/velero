@@ -41,11 +41,16 @@ type podTemplateConfig struct {
 	withSecret                      bool
 	defaultRepoMaintenanceFrequency time.Duration
 	garbageCollectionFrequency      time.Duration
+	podVolumeOperationTimeout       time.Duration
 	plugins                         []string
 	features                        []string
 	defaultVolumesToFsBackup        bool
 	serviceAccountName              string
 	uploaderType                    string
+	defaultSnapshotMoveData         bool
+	privilegedNodeAgent             bool
+	disableInformerCache            bool
+	scheduleSkipImmediately         bool
 }
 
 func WithImage(image string) podTemplateOption {
@@ -112,6 +117,12 @@ func WithGarbageCollectionFrequency(val time.Duration) podTemplateOption {
 	}
 }
 
+func WithPodVolumeOperationTimeout(val time.Duration) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.podVolumeOperationTimeout = val
+	}
+}
+
 func WithPlugins(plugins []string) podTemplateOption {
 	return func(c *podTemplateConfig) {
 		c.plugins = plugins
@@ -136,9 +147,33 @@ func WithDefaultVolumesToFsBackup() podTemplateOption {
 	}
 }
 
+func WithDefaultSnapshotMoveData() podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.defaultSnapshotMoveData = true
+	}
+}
+
+func WithDisableInformerCache() podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.disableInformerCache = true
+	}
+}
+
 func WithServiceAccountName(sa string) podTemplateOption {
 	return func(c *podTemplateConfig) {
 		c.serviceAccountName = sa
+	}
+}
+
+func WithPrivilegedNodeAgent() podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.privilegedNodeAgent = true
+	}
+}
+
+func WithScheduleSkipImmediately(b bool) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.scheduleSkipImmediately = b
 	}
 }
 
@@ -156,7 +191,6 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1.Deployment 
 	imageParts := strings.Split(c.image, ":")
 	if len(imageParts) == 2 && imageParts[1] != "latest" {
 		pullPolicy = corev1.PullIfNotPresent
-
 	}
 
 	args := []string{"server"}
@@ -168,8 +202,36 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1.Deployment 
 		args = append(args, "--default-volumes-to-fs-backup=true")
 	}
 
+	if c.defaultSnapshotMoveData {
+		args = append(args, "--default-snapshot-move-data=true")
+	}
+
+	if c.disableInformerCache {
+		args = append(args, "--disable-informer-cache=true")
+	}
+
+	if c.scheduleSkipImmediately {
+		args = append(args, "--schedule-skip-immediately=true")
+	}
+
 	if len(c.uploaderType) > 0 {
 		args = append(args, fmt.Sprintf("--uploader-type=%s", c.uploaderType))
+	}
+
+	if c.restoreOnly {
+		args = append(args, "--restore-only")
+	}
+
+	if c.defaultRepoMaintenanceFrequency > 0 {
+		args = append(args, fmt.Sprintf("--default-repo-maintain-frequency=%v", c.defaultRepoMaintenanceFrequency))
+	}
+
+	if c.garbageCollectionFrequency > 0 {
+		args = append(args, fmt.Sprintf("--garbage-collection-frequency=%v", c.garbageCollectionFrequency))
+	}
+
+	if c.podVolumeOperationTimeout > 0 {
+		args = append(args, fmt.Sprintf("--fs-backup-timeout=%v", c.podVolumeOperationTimeout))
 	}
 
 	deployment := &appsv1.Deployment{
@@ -291,24 +353,11 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1.Deployment 
 
 	deployment.Spec.Template.Spec.Containers[0].Env = append(deployment.Spec.Template.Spec.Containers[0].Env, c.envVars...)
 
-	if c.restoreOnly {
-		deployment.Spec.Template.Spec.Containers[0].Args = append(deployment.Spec.Template.Spec.Containers[0].Args, "--restore-only")
-	}
-
-	if c.defaultRepoMaintenanceFrequency > 0 {
-		deployment.Spec.Template.Spec.Containers[0].Args = append(deployment.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("--default-repo-maintain-frequency=%v", c.defaultRepoMaintenanceFrequency))
-	}
-
-	if c.garbageCollectionFrequency > 0 {
-		deployment.Spec.Template.Spec.Containers[0].Args = append(deployment.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("--garbage-collection-frequency=%v", c.garbageCollectionFrequency))
-	}
-
 	if len(c.plugins) > 0 {
 		for _, image := range c.plugins {
 			container := *builder.ForPluginContainer(image, pullPolicy).Result()
 			deployment.Spec.Template.Spec.InitContainers = append(deployment.Spec.Template.Spec.InitContainers, container)
 		}
-
 	}
 
 	return deployment

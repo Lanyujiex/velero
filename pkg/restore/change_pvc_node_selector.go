@@ -59,8 +59,9 @@ func (p *ChangePVCNodeSelectorAction) AppliesTo() (velero.ResourceSelector, erro
 }
 
 // Execute updates the pvc's selected-node annotation:
-//    a) if node mapping found in the config map for the plugin
-//	  b) if node mentioned in annotation doesn't exist
+//
+//	a) if node mapping found in the config map for the plugin
+//	b) if node mentioned in annotation doesn't exist
 func (p *ChangePVCNodeSelectorAction) Execute(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
 	p.logger.Info("Executing ChangePVCNodeSelectorAction")
 	defer p.logger.Info("Done executing ChangePVCNodeSelectorAction")
@@ -139,7 +140,7 @@ func (p *ChangePVCNodeSelectorAction) Execute(input *velero.RestoreItemActionExe
 
 func getNewNodeFromConfigMap(client corev1client.ConfigMapInterface, node string) (string, error) {
 	// fetch node mapping from configMap
-	config, err := getPluginConfig(common.PluginKindRestoreItemAction, "velero.io/change-pvc-node-selector", client)
+	config, err := common.GetPluginConfig(common.PluginKindRestoreItemAction, "velero.io/change-pvc-node-selector", client)
 	if err != nil {
 		return "", err
 	}

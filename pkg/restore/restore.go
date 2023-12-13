@@ -21,7 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
@@ -42,17 +44,22 @@ import (
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/resourcemodifiers"
+	internalVolume "github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/archive"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
 	"github.com/vmware-tanzu/velero/pkg/features"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/plugin/framework"
@@ -63,11 +70,16 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
+	csiutil "github.com/vmware-tanzu/velero/pkg/util/csi"
 	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
-	. "github.com/vmware-tanzu/velero/pkg/util/results"
+	"github.com/vmware-tanzu/velero/pkg/util/results"
 	"github.com/vmware-tanzu/velero/pkg/volume"
 )
+
+var resourceMustHave = []string{
+	"datauploads.velero.io",
+}
 
 type VolumeSnapshotterGetter interface {
 	GetVolumeSnapshotter(name string) (vsv1.VolumeSnapshotter, error)
@@ -79,13 +91,12 @@ type Restorer interface {
 	Restore(req *Request,
 		actions []riav2.RestoreItemAction,
 		volumeSnapshotterGetter VolumeSnapshotterGetter,
-	) (Result, Result)
+	) (results.Result, results.Result)
 	RestoreWithResolvers(
 		req *Request,
 		restoreItemActionResolver framework.RestoreItemActionResolverV2,
-		itemSnapshotterResolver framework.ItemSnapshotterResolver,
 		volumeSnapshotterGetter VolumeSnapshotterGetter,
-	) (Result, Result)
+	) (results.Result, results.Result)
 }
 
 // kubernetesRestorer implements Restorer for restoring into a Kubernetes cluster.
@@ -96,6 +107,7 @@ type kubernetesRestorer struct {
 	podVolumeRestorerFactory   podvolume.RestorerFactory
 	podVolumeTimeout           time.Duration
 	resourceTerminatingTimeout time.Duration
+	resourceTimeout            time.Duration
 	resourcePriorities         Priorities
 	fileSystem                 filesystem.Interface
 	pvRenamer                  func(string) (string, error)
@@ -104,6 +116,7 @@ type kubernetesRestorer struct {
 	podGetter                  cache.Getter
 	credentialFileStore        credentials.FileStore
 	kbClient                   crclient.Client
+	featureVerifier            features.Verifier
 }
 
 // NewKubernetesRestorer creates a new kubernetesRestorer.
@@ -115,11 +128,13 @@ func NewKubernetesRestorer(
 	podVolumeRestorerFactory podvolume.RestorerFactory,
 	podVolumeTimeout time.Duration,
 	resourceTerminatingTimeout time.Duration,
+	resourceTimeout time.Duration,
 	logger logrus.FieldLogger,
 	podCommandExecutor podexec.PodCommandExecutor,
 	podGetter cache.Getter,
 	credentialStore credentials.FileStore,
 	kbClient crclient.Client,
+	featureVerifier features.Verifier,
 ) (Restorer, error) {
 	return &kubernetesRestorer{
 		discoveryHelper:            discoveryHelper,
@@ -128,14 +143,15 @@ func NewKubernetesRestorer(
 		podVolumeRestorerFactory:   podVolumeRestorerFactory,
 		podVolumeTimeout:           podVolumeTimeout,
 		resourceTerminatingTimeout: resourceTerminatingTimeout,
+		resourceTimeout:            resourceTimeout,
 		resourcePriorities:         resourcePriorities,
 		logger:                     logger,
 		pvRenamer: func(string) (string, error) {
-			veleroCloneUuid, err := uuid.NewRandom()
+			veleroCloneUUID, err := uuid.NewRandom()
 			if err != nil {
 				return "", errors.WithStack(err)
 			}
-			veleroCloneName := "velero-clone-" + veleroCloneUuid.String()
+			veleroCloneName := "velero-clone-" + veleroCloneUUID.String()
 			return veleroCloneName, nil
 		},
 		fileSystem:          filesystem.NewFileSystem(),
@@ -143,6 +159,7 @@ func NewKubernetesRestorer(
 		podGetter:           podGetter,
 		credentialFileStore: credentialStore,
 		kbClient:            kbClient,
+		featureVerifier:     featureVerifier,
 	}, nil
 }
 
@@ -153,18 +170,16 @@ func (kr *kubernetesRestorer) Restore(
 	req *Request,
 	actions []riav2.RestoreItemAction,
 	volumeSnapshotterGetter VolumeSnapshotterGetter,
-) (Result, Result) {
+) (results.Result, results.Result) {
 	resolver := framework.NewRestoreItemActionResolverV2(actions)
-	snapshotItemResolver := framework.NewItemSnapshotterResolver(nil)
-	return kr.RestoreWithResolvers(req, resolver, snapshotItemResolver, volumeSnapshotterGetter)
+	return kr.RestoreWithResolvers(req, resolver, volumeSnapshotterGetter)
 }
 
 func (kr *kubernetesRestorer) RestoreWithResolvers(
 	req *Request,
 	restoreItemActionResolver framework.RestoreItemActionResolverV2,
-	itemSnapshotterResolver framework.ItemSnapshotterResolver,
 	volumeSnapshotterGetter VolumeSnapshotterGetter,
-) (Result, Result) {
+) (results.Result, results.Result) {
 	// metav1.LabelSelectorAsSelector converts a nil LabelSelector to a
 	// Nothing Selector, i.e. a selector that matches nothing. We want
 	// a selector that matches everything. This can be accomplished by
@@ -179,7 +194,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		for _, s := range req.Restore.Spec.OrLabelSelectors {
 			labelAsSelector, err := metav1.LabelSelectorAsSelector(s)
 			if err != nil {
-				return Result{}, Result{Velero: []string{err.Error()}}
+				return results.Result{}, results.Result{Velero: []string{err.Error()}}
 			}
 			OrSelectors = append(OrSelectors, labelAsSelector)
 		}
@@ -187,7 +202,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 
 	selector, err := metav1.LabelSelectorAsSelector(ls)
 	if err != nil {
-		return Result{}, Result{Velero: []string{err.Error()}}
+		return results.Result{}, results.Result{Velero: []string{err.Error()}}
 	}
 
 	// Get resource includes-excludes.
@@ -215,12 +230,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 
 	resolvedActions, err := restoreItemActionResolver.ResolveActions(kr.discoveryHelper, kr.logger)
 	if err != nil {
-		return Result{}, Result{Velero: []string{err.Error()}}
-	}
-
-	resolvedItemSnapshotterActions, err := itemSnapshotterResolver.ResolveActions(kr.discoveryHelper, kr.logger)
-	if err != nil {
-		return Result{}, Result{Velero: []string{err.Error()}}
+		return results.Result{}, results.Result{Velero: []string{err.Error()}}
 	}
 
 	podVolumeTimeout := kr.podVolumeTimeout
@@ -243,13 +253,13 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 	if kr.podVolumeRestorerFactory != nil {
 		podVolumeRestorer, err = kr.podVolumeRestorerFactory.NewRestorer(ctx, req.Restore)
 		if err != nil {
-			return Result{}, Result{Velero: []string{err.Error()}}
+			return results.Result{}, results.Result{Velero: []string{err.Error()}}
 		}
 	}
 
 	resourceRestoreHooks, err := hook.GetRestoreHooksFromSpec(&req.Restore.Spec.Hooks)
 	if err != nil {
-		return Result{}, Result{Velero: []string{err.Error()}}
+		return results.Result{}, results.Result{Velero: []string{err.Error()}}
 	}
 	hooksCtx, hooksCancelFunc := go_context.WithCancel(go_context.Background())
 	waitExecHookHandler := &hook.DefaultWaitExecHookHandler{
@@ -270,7 +280,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		credentialFileStore:     kr.credentialFileStore,
 	}
 
-	req.RestoredItems = make(map[itemKey]string)
+	req.RestoredItems = make(map[itemKey]restoredItemStatus)
 
 	restoreCtx := &restoreContext{
 		backup:                         req.Backup,
@@ -279,6 +289,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		resourceIncludesExcludes:       resourceIncludesExcludes,
 		resourceStatusIncludesExcludes: restoreStatusIncludesExcludes,
 		namespaceIncludesExcludes:      namespaceIncludesExcludes,
+		resourceMustHave:               sets.NewString(resourceMustHave...),
 		chosenGrpVersToRestore:         make(map[string]ChosenGroupVersion),
 		selector:                       selector,
 		OrSelectors:                    OrSelectors,
@@ -287,27 +298,36 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		fileSystem:                     kr.fileSystem,
 		namespaceClient:                kr.namespaceClient,
 		restoreItemActions:             resolvedActions,
-		itemSnapshotterActions:         resolvedItemSnapshotterActions,
 		volumeSnapshotterGetter:        volumeSnapshotterGetter,
 		podVolumeRestorer:              podVolumeRestorer,
 		podVolumeErrs:                  make(chan error),
 		pvsToProvision:                 sets.NewString(),
 		pvRestorer:                     pvRestorer,
 		volumeSnapshots:                req.VolumeSnapshots,
+		csiVolumeSnapshots:             req.CSIVolumeSnapshots,
 		podVolumeBackups:               req.PodVolumeBackups,
 		resourceTerminatingTimeout:     kr.resourceTerminatingTimeout,
+		resourceTimeout:                kr.resourceTimeout,
 		resourceClients:                make(map[resourceClientKey]client.Dynamic),
+		dynamicInformerFactories:       make(map[string]*informerFactoryWithContext),
+		resourceInformers:              make(map[resourceClientKey]informers.GenericInformer),
 		restoredItems:                  req.RestoredItems,
 		renamedPVs:                     make(map[string]string),
 		pvRenamer:                      kr.pvRenamer,
 		discoveryHelper:                kr.discoveryHelper,
 		resourcePriorities:             kr.resourcePriorities,
 		resourceRestoreHooks:           resourceRestoreHooks,
-		hooksErrs:                      make(chan error),
+		hooksErrs:                      make(chan hook.HookErrInfo),
 		waitExecHookHandler:            waitExecHookHandler,
 		hooksContext:                   hooksCtx,
 		hooksCancelFunc:                hooksCancelFunc,
 		kbClient:                       kr.kbClient,
+		itemOperationsList:             req.GetItemOperationsList(),
+		resourceModifiers:              req.ResourceModifiers,
+		disableInformerCache:           req.DisableInformerCache,
+		featureVerifier:                kr.featureVerifier,
+		hookTracker:                    hook.NewHookTracker(),
+		volumeInfoMap:                  req.VolumeInfoMap,
 	}
 
 	return restoreCtx.execute()
@@ -321,6 +341,7 @@ type restoreContext struct {
 	resourceIncludesExcludes       *collections.IncludesExcludes
 	resourceStatusIncludesExcludes *collections.IncludesExcludes
 	namespaceIncludesExcludes      *collections.IncludesExcludes
+	resourceMustHave               sets.String
 	chosenGrpVersToRestore         map[string]ChosenGroupVersion
 	selector                       labels.Selector
 	OrSelectors                    []labels.Selector
@@ -329,7 +350,6 @@ type restoreContext struct {
 	fileSystem                     filesystem.Interface
 	namespaceClient                corev1.NamespaceInterface
 	restoreItemActions             []framework.RestoreItemResolvedActionV2
-	itemSnapshotterActions         []framework.ItemSnapshotterResolvedAction
 	volumeSnapshotterGetter        VolumeSnapshotterGetter
 	podVolumeRestorer              podvolume.Restorer
 	podVolumeWaitGroup             sync.WaitGroup
@@ -337,26 +357,42 @@ type restoreContext struct {
 	pvsToProvision                 sets.String
 	pvRestorer                     PVRestorer
 	volumeSnapshots                []*volume.Snapshot
+	csiVolumeSnapshots             []*snapshotv1api.VolumeSnapshot
 	podVolumeBackups               []*velerov1api.PodVolumeBackup
 	resourceTerminatingTimeout     time.Duration
+	resourceTimeout                time.Duration
 	resourceClients                map[resourceClientKey]client.Dynamic
-	restoredItems                  map[itemKey]string
+	dynamicInformerFactories       map[string]*informerFactoryWithContext
+	resourceInformers              map[resourceClientKey]informers.GenericInformer
+	restoredItems                  map[itemKey]restoredItemStatus
 	renamedPVs                     map[string]string
 	pvRenamer                      func(string) (string, error)
 	discoveryHelper                discovery.Helper
 	resourcePriorities             Priorities
 	hooksWaitGroup                 sync.WaitGroup
-	hooksErrs                      chan error
+	hooksErrs                      chan hook.HookErrInfo
 	resourceRestoreHooks           []hook.ResourceRestoreHook
 	waitExecHookHandler            hook.WaitExecHookHandler
 	hooksContext                   go_context.Context
 	hooksCancelFunc                go_context.CancelFunc
 	kbClient                       crclient.Client
+	itemOperationsList             *[]*itemoperation.RestoreOperation
+	resourceModifiers              *resourcemodifiers.ResourceModifiers
+	disableInformerCache           bool
+	featureVerifier                features.Verifier
+	hookTracker                    *hook.HookTracker
+	volumeInfoMap                  map[string]internalVolume.VolumeInfo
 }
 
 type resourceClientKey struct {
 	resource  schema.GroupVersionResource
 	namespace string
+}
+
+type informerFactoryWithContext struct {
+	factory dynamicinformer.DynamicSharedInformerFactory
+	context go_context.Context
+	cancel  go_context.CancelFunc
 }
 
 // getOrderedResources returns an ordered list of resource identifiers to restore,
@@ -392,8 +428,8 @@ type progressUpdate struct {
 	totalItems, itemsRestored int
 }
 
-func (ctx *restoreContext) execute() (Result, Result) {
-	warnings, errs := Result{}, Result{}
+func (ctx *restoreContext) execute() (results.Result, results.Result) {
+	warnings, errs := results.Result{}, results.Result{}
 
 	ctx.log.Infof("Starting restore of backup %s", kube.NamespaceAndName(ctx.backup))
 
@@ -403,7 +439,22 @@ func (ctx *restoreContext) execute() (Result, Result) {
 		errs.AddVeleroError(err)
 		return warnings, errs
 	}
-	defer ctx.fileSystem.RemoveAll(dir)
+	defer func() {
+		if err := ctx.fileSystem.RemoveAll(dir); err != nil {
+			ctx.log.Errorf("error removing temporary directory %s: %s", dir, err.Error())
+		}
+	}()
+
+	// Need to stop all informers if enabled
+	if !ctx.disableInformerCache {
+		defer func() {
+			// Call the cancel func to close the channel for each started informer
+			for _, factory := range ctx.dynamicInformerFactories {
+				factory.cancel()
+			}
+			// After upgrading to client-go 0.27 or newer, also call Shutdown for each informer factory
+		}()
+	}
 
 	// Need to set this for additionalItems to be restored.
 	ctx.restoreDir = dir
@@ -484,17 +535,35 @@ func (ctx *restoreContext) execute() (Result, Result) {
 	}
 
 	for _, selectedResource := range crdResourceCollection {
-		var w, e Result
-		// Restore this resource
+		var w, e results.Result
+		// Restore this resource, the update channel is set to nil, to avoid misleading value of "totalItems"
+		// more details see #5990
 		processedItems, w, e = ctx.processSelectedResource(
 			selectedResource,
 			totalItems,
 			processedItems,
 			existingNamespaces,
-			update,
+			nil,
 		)
 		warnings.Merge(&w)
 		errs.Merge(&e)
+	}
+
+	var createdOrUpdatedCRDs bool
+	for _, restoredItem := range ctx.restoredItems {
+		if restoredItem.action == itemRestoreResultCreated || restoredItem.action == itemRestoreResultUpdated {
+			createdOrUpdatedCRDs = true
+			break
+		}
+	}
+	// If we just restored custom resource definitions (CRDs), refresh
+	// discovery because the restored CRDs may have created or updated new APIs that
+	// didn't previously exist in the cluster, and we want to be able to
+	// resolve & restore instances of them in subsequent loop iterations.
+	if createdOrUpdatedCRDs {
+		if err := ctx.discoveryHelper.Refresh(); err != nil {
+			warnings.Add("", errors.Wrap(err, "refresh discovery after restoring CRDs"))
+		}
 	}
 
 	// Restore everything else
@@ -508,6 +577,32 @@ func (ctx *restoreContext) execute() (Result, Result) {
 	warnings.Merge(&w)
 	errs.Merge(&e)
 
+	// initialize informer caches for selected resources if enabled
+	if !ctx.disableInformerCache {
+		// CRD informer will have already been initialized if any CRDs were created,
+		// but already-initialized informers aren't re-initialized because getGenericInformer
+		// looks for an existing one first.
+		factoriesToStart := make(map[string]*informerFactoryWithContext)
+		for _, informerResource := range selectedResourceCollection {
+			gr := schema.ParseGroupResource(informerResource.resource)
+			for _, items := range informerResource.selectedItemsByNamespace {
+				// don't use ns key since it represents original ns, not mapped ns
+				if len(items) == 0 {
+					continue
+				}
+				// use the first item in the list to initialize the informer. The rest of the list
+				// should share the same gvr and namespace
+				_, factory := ctx.getGenericInformerInternal(gr, items[0].version, items[0].targetNamespace)
+				if factory != nil {
+					factoriesToStart[items[0].targetNamespace] = factory
+				}
+			}
+		}
+		for _, factoryWithContext := range factoriesToStart {
+			factoryWithContext.factory.WaitForCacheSync(factoryWithContext.context.Done())
+		}
+	}
+
 	// reset processedItems and totalItems before processing full resource list
 	processedItems = 0
 	totalItems = 0
@@ -516,7 +611,7 @@ func (ctx *restoreContext) execute() (Result, Result) {
 	}
 
 	for _, selectedResource := range selectedResourceCollection {
-		var w, e Result
+		var w, e results.Result
 		// Restore this resource
 		processedItems, w, e = ctx.processSelectedResource(
 			selectedResource,
@@ -532,6 +627,21 @@ func (ctx *restoreContext) execute() (Result, Result) {
 	// Close the progress update channel.
 	quit <- struct{}{}
 
+	// Clean the DataUploadResult ConfigMaps
+	defer func() {
+		opts := []crclient.DeleteAllOfOption{
+			crclient.InNamespace(ctx.restore.Namespace),
+			crclient.MatchingLabels{
+				velerov1api.RestoreUIDLabel:    string(ctx.restore.UID),
+				velerov1api.ResourceUsageLabel: string(velerov1api.VeleroResourceUsageDataUploadResult),
+			},
+		}
+		err := ctx.kbClient.DeleteAllOf(go_context.Background(), &v1.ConfigMap{}, opts...)
+		if err != nil {
+			ctx.log.Errorf("Fail to batch delete DataUploadResult ConfigMaps for restore %s: %s", ctx.restore.Name, err.Error())
+		}
+	}()
+
 	// Do a final progress update as stopping the ticker might have left last few
 	// updates from taking place.
 	updated := ctx.restore.DeepCopy()
@@ -540,11 +650,6 @@ func (ctx *restoreContext) execute() (Result, Result) {
 	}
 	updated.Status.Progress.TotalItems = len(ctx.restoredItems)
 	updated.Status.Progress.ItemsRestored = len(ctx.restoredItems)
-
-	err = kube.PatchResource(ctx.restore, updated, ctx.kbClient)
-	if err != nil {
-		ctx.log.WithError(errors.WithStack((err))).Warn("Updating restore status.progress")
-	}
 
 	// Wait for all of the pod volume restore goroutines to be done, which is
 	// only possible once all of their errors have been received by the loop
@@ -575,10 +680,23 @@ func (ctx *restoreContext) execute() (Result, Result) {
 		ctx.hooksWaitGroup.Wait()
 		close(ctx.hooksErrs)
 	}()
-	for err := range ctx.hooksErrs {
-		errs.Velero = append(errs.Velero, err.Error())
+	for errInfo := range ctx.hooksErrs {
+		errs.Add(errInfo.Namespace, errInfo.Err)
 	}
 	ctx.log.Info("Done waiting for all post-restore exec hooks to complete")
+
+	// update hooks execution status
+	if updated.Status.HookStatus == nil {
+		updated.Status.HookStatus = &velerov1api.HookStatus{}
+	}
+	updated.Status.HookStatus.HooksAttempted, updated.Status.HookStatus.HooksFailed = ctx.hookTracker.Stat()
+	ctx.log.Infof("hookTracker: %+v, hookAttempted: %d, hookFailed: %d", ctx.hookTracker.GetTracker(), updated.Status.HookStatus.HooksAttempted, updated.Status.HookStatus.HooksFailed)
+
+	// patch the restore status
+	err = kube.PatchResource(ctx.restore, updated, ctx.kbClient)
+	if err != nil {
+		ctx.log.WithError(errors.WithStack((err))).Warn("Updating restore status")
+	}
 
 	return warnings, errs
 }
@@ -592,12 +710,15 @@ func (ctx *restoreContext) processSelectedResource(
 	processedItems int,
 	existingNamespaces sets.String,
 	update chan progressUpdate,
-) (int, Result, Result) {
-	warnings, errs := Result{}, Result{}
+) (int, results.Result, results.Result) {
+	warnings, errs := results.Result{}, results.Result{}
 	groupResource := schema.ParseGroupResource(selectedResource.resource)
 
 	for namespace, selectedItems := range selectedResource.selectedItemsByNamespace {
 		for _, selectedItem := range selectedItems {
+			if groupResource == kuberesource.Namespaces {
+				namespace = selectedItem.name
+			}
 			// If we don't know whether this namespace exists yet, attempt to create
 			// it in order to ensure it exists. Try to get it from the backup tarball
 			// (in order to get any backed-up metadata), but if we don't find it there,
@@ -627,12 +748,16 @@ func (ctx *restoreContext) processSelectedResource(
 						namespace: ns.Namespace,
 						name:      ns.Name,
 					}
-					ctx.restoredItems[itemKey] = itemRestoreResultCreated
+					ctx.restoredItems[itemKey] = restoredItemStatus{action: itemRestoreResultCreated, itemExists: true}
 				}
 
 				// Keep track of namespaces that we know exist so we don't
 				// have to try to create them multiple times.
 				existingNamespaces.Insert(selectedItem.targetNamespace)
+			}
+			// For namespaces resources we don't need to following steps
+			if groupResource == kuberesource.Namespaces {
+				continue
 			}
 
 			obj, err := archive.Unmarshal(ctx.fileSystem, selectedItem.path)
@@ -648,7 +773,7 @@ func (ctx *restoreContext) processSelectedResource(
 				continue
 			}
 
-			w, e := ctx.restoreItem(obj, groupResource, selectedItem.targetNamespace)
+			w, e, _ := ctx.restoreItem(obj, groupResource, selectedItem.targetNamespace)
 			warnings.Merge(&w)
 			errs.Merge(&e)
 			processedItems++
@@ -659,9 +784,11 @@ func (ctx *restoreContext) processSelectedResource(
 			// time, we don't want previously known items counted twice as
 			// they are present in both restoredItems and totalItems.
 			actualTotalItems := len(ctx.restoredItems) + (totalItems - processedItems)
-			update <- progressUpdate{
-				totalItems:    actualTotalItems,
-				itemsRestored: len(ctx.restoredItems),
+			if update != nil {
+				update <- progressUpdate{
+					totalItems:    actualTotalItems,
+					itemsRestored: len(ctx.restoredItems),
+				}
 			}
 			ctx.log.WithFields(map[string]interface{}{
 				"progress":  "",
@@ -672,15 +799,6 @@ func (ctx *restoreContext) processSelectedResource(
 		}
 	}
 
-	// If we just restored custom resource definitions (CRDs), refresh
-	// discovery because the restored CRDs may have created new APIs that
-	// didn't previously exist in the cluster, and we want to be able to
-	// resolve & restore instances of them in subsequent loop iterations.
-	if groupResource == kuberesource.CustomResourceDefinitions {
-		if err := ctx.discoveryHelper.Refresh(); err != nil {
-			warnings.Add("", errors.Wrap(err, "refresh discovery after restoring CRDs"))
-		}
-	}
 	return processedItems, warnings, errs
 }
 
@@ -692,7 +810,7 @@ func getNamespace(logger logrus.FieldLogger, path, remappedName string) *v1.Name
 	var nsBytes []byte
 	var err error
 
-	if nsBytes, err = ioutil.ReadFile(path); err != nil {
+	if nsBytes, err = os.ReadFile(path); err != nil {
 		return &v1.Namespace{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "Namespace",
@@ -706,7 +824,7 @@ func getNamespace(logger logrus.FieldLogger, path, remappedName string) *v1.Name
 
 	var backupNS v1.Namespace
 	if err := json.Unmarshal(nsBytes, &backupNS); err != nil {
-		logger.Warnf("Error unmarshalling namespace from backup, creating new one.")
+		logger.Warnf("Error unmarshaling namespace from backup, creating new one.")
 		return &v1.Namespace{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "Namespace",
@@ -842,9 +960,8 @@ func (ctx *restoreContext) crdAvailable(name string, crdClient client.Dynamic) (
 	crdLogger := ctx.log.WithField("crdName", name)
 
 	var available bool
-	// Wait 1 minute rather than the standard resource timeout, since each CRD
-	// will transition fairly quickly.
-	err := wait.PollImmediate(time.Second, time.Minute*1, func() (bool, error) {
+
+	err := wait.PollImmediate(time.Second, ctx.resourceTimeout, func() (bool, error) {
 		unstructuredCRD, err := crdClient.Get(name, metav1.GetOptions{})
 		if err != nil {
 			return true, err
@@ -870,11 +987,50 @@ func (ctx *restoreContext) crdAvailable(name string, crdClient client.Dynamic) (
 	return available, err
 }
 
-func (ctx *restoreContext) getResourceClient(groupResource schema.GroupResource, obj *unstructured.Unstructured, namespace string) (client.Dynamic, error) {
-	key := resourceClientKey{
-		resource:  groupResource.WithVersion(obj.GroupVersionKind().Version),
+// itemsAvailable waits for the passed-in additional items to be available for use before letting the restore continue.
+func (ctx *restoreContext) itemsAvailable(action framework.RestoreItemResolvedActionV2, restoreItemOut *velero.RestoreItemActionExecuteOutput) (bool, error) {
+	// if RestoreItemAction doesn't define set WaitForAdditionalItems, then return true
+	if !restoreItemOut.WaitForAdditionalItems {
+		return true, nil
+	}
+	var available bool
+	timeout := ctx.resourceTimeout
+	if restoreItemOut.AdditionalItemsReadyTimeout != 0 {
+		timeout = restoreItemOut.AdditionalItemsReadyTimeout
+	}
+
+	err := wait.PollImmediate(time.Second, timeout, func() (bool, error) {
+		var err error
+		available, err = action.AreAdditionalItemsReady(restoreItemOut.AdditionalItems, ctx.restore)
+
+		if err != nil {
+			return true, err
+		}
+
+		if !available {
+			ctx.log.Debug("AdditionalItems not yet ready for use")
+		}
+
+		// If the AdditionalItems are not available, keep polling (false, nil)
+		// If the AdditionalItems are available, break the poll and return back to caller (true, nil)
+		return available, nil
+	})
+
+	if err == wait.ErrWaitTimeout {
+		ctx.log.Debug("timeout reached waiting for AdditionalItems to be ready")
+	}
+
+	return available, err
+}
+
+func getResourceClientKey(groupResource schema.GroupResource, version, namespace string) resourceClientKey {
+	return resourceClientKey{
+		resource:  groupResource.WithVersion(version),
 		namespace: namespace,
 	}
+}
+func (ctx *restoreContext) getResourceClient(groupResource schema.GroupResource, obj *unstructured.Unstructured, namespace string) (client.Dynamic, error) {
+	key := getResourceClientKey(groupResource, obj.GroupVersionKind().Version, namespace)
 
 	if client, ok := ctx.resourceClients[key]; ok {
 		return client, nil
@@ -898,6 +1054,49 @@ func (ctx *restoreContext) getResourceClient(groupResource schema.GroupResource,
 	return client, nil
 }
 
+// if new informer is created, non-nil factory is returned
+func (ctx *restoreContext) getGenericInformerInternal(groupResource schema.GroupResource, version, namespace string) (informers.GenericInformer, *informerFactoryWithContext) {
+	var returnFactory *informerFactoryWithContext
+
+	key := getResourceClientKey(groupResource, version, namespace)
+	factoryWithContext, ok := ctx.dynamicInformerFactories[key.namespace]
+	if !ok {
+		factory := ctx.dynamicFactory.DynamicSharedInformerFactoryForNamespace(namespace)
+		informerContext, informerCancel := signal.NotifyContext(go_context.Background(), os.Interrupt)
+		factoryWithContext = &informerFactoryWithContext{
+			factory: factory,
+			context: informerContext,
+			cancel:  informerCancel,
+		}
+		ctx.dynamicInformerFactories[key.namespace] = factoryWithContext
+	}
+	informer, ok := ctx.resourceInformers[key]
+	if !ok {
+		ctx.log.Infof("[debug] Creating factory for %s in namespace %s", key.resource, key.namespace)
+		informer = factoryWithContext.factory.ForResource(key.resource)
+		factoryWithContext.factory.Start(factoryWithContext.context.Done())
+		ctx.resourceInformers[key] = informer
+		returnFactory = factoryWithContext
+	}
+	return informer, returnFactory
+}
+
+func (ctx *restoreContext) getGenericInformer(groupResource schema.GroupResource, version, namespace string) informers.GenericInformer {
+	informer, factoryWithContext := ctx.getGenericInformerInternal(groupResource, version, namespace)
+	if factoryWithContext != nil {
+		factoryWithContext.factory.WaitForCacheSync(factoryWithContext.context.Done())
+	}
+	return informer
+}
+func (ctx *restoreContext) getResourceLister(groupResource schema.GroupResource, obj *unstructured.Unstructured, namespace string) cache.GenericNamespaceLister {
+	informer := ctx.getGenericInformer(groupResource, obj.GroupVersionKind().Version, namespace)
+	if namespace == "" {
+		return informer.Lister()
+	} else {
+		return informer.Lister().ByNamespace(namespace)
+	}
+}
+
 func getResourceID(groupResource schema.GroupResource, namespace, name string) string {
 	if namespace == "" {
 		return fmt.Sprintf("%s/%s", groupResource.String(), name)
@@ -906,20 +1105,38 @@ func getResourceID(groupResource schema.GroupResource, namespace, name string) s
 	return fmt.Sprintf("%s/%s/%s", groupResource.String(), namespace, name)
 }
 
-func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupResource schema.GroupResource, namespace string) (Result, Result) {
-	warnings, errs := Result{}, Result{}
+func (ctx *restoreContext) getResource(groupResource schema.GroupResource, obj *unstructured.Unstructured, namespace, name string) (*unstructured.Unstructured, error) {
+	lister := ctx.getResourceLister(groupResource, obj, namespace)
+	clusterObj, err := lister.Get(name)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error getting resource from lister for %s, %s/%s", groupResource, namespace, name)
+	}
+	u, ok := clusterObj.(*unstructured.Unstructured)
+	if !ok {
+		ctx.log.WithError(errors.WithStack(fmt.Errorf("expected *unstructured.Unstructured but got %T", u))).Error("unable to understand entry returned from client")
+		return nil, fmt.Errorf("expected *unstructured.Unstructured but got %T", u)
+	}
+	return u, nil
+}
+
+func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupResource schema.GroupResource, namespace string) (results.Result, results.Result, bool) {
+	warnings, errs := results.Result{}, results.Result{}
+	// itemExists bool is used to determine whether to include this item in the "wait for additional items" list
+	itemExists := false
 	resourceID := getResourceID(groupResource, namespace, obj.GetName())
+
+	restoreLogger := ctx.log.WithFields(logrus.Fields{
+		"namespace":     obj.GetNamespace(),
+		"name":          obj.GetName(),
+		"groupResource": groupResource.String(),
+	})
 
 	// Check if group/resource should be restored. We need to do this here since
 	// this method may be getting called for an additional item which is a group/resource
 	// that's excluded.
 	if !ctx.resourceIncludesExcludes.ShouldInclude(groupResource.String()) {
-		ctx.log.WithFields(logrus.Fields{
-			"namespace":     obj.GetNamespace(),
-			"name":          obj.GetName(),
-			"groupResource": groupResource.String(),
-		}).Info("Not restoring item because resource is excluded")
-		return warnings, errs
+		restoreLogger.Info("Not restoring item because resource is excluded")
+		return warnings, errs, itemExists
 	}
 
 	// Check if namespace/cluster-scoped resource should be restored. We need
@@ -929,41 +1146,33 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	// via obj.GetNamespace()) instead of the namespace parameter, because we want
 	// to check the *original* namespace, not the remapped one if it's been remapped.
 	if namespace != "" {
-		if !ctx.namespaceIncludesExcludes.ShouldInclude(obj.GetNamespace()) {
-			ctx.log.WithFields(logrus.Fields{
-				"namespace":     obj.GetNamespace(),
-				"name":          obj.GetName(),
-				"groupResource": groupResource.String(),
-			}).Info("Not restoring item because namespace is excluded")
-			return warnings, errs
+		if !ctx.namespaceIncludesExcludes.ShouldInclude(obj.GetNamespace()) && !ctx.resourceMustHave.Has(groupResource.String()) {
+			restoreLogger.Info("Not restoring item because namespace is excluded")
+			return warnings, errs, itemExists
 		}
 
 		// If the namespace scoped resource should be restored, ensure that the
 		// namespace into which the resource is being restored into exists.
 		// This is the *remapped* namespace that we are ensuring exists.
 		nsToEnsure := getNamespace(ctx.log, archive.GetItemFilePath(ctx.restoreDir, "namespaces", "", obj.GetNamespace()), namespace)
-		if _, nsCreated, err := kube.EnsureNamespaceExistsAndIsReady(nsToEnsure, ctx.namespaceClient, ctx.resourceTerminatingTimeout); err != nil {
+		_, nsCreated, err := kube.EnsureNamespaceExistsAndIsReady(nsToEnsure, ctx.namespaceClient, ctx.resourceTerminatingTimeout)
+		if err != nil {
 			errs.AddVeleroError(err)
-			return warnings, errs
-		} else {
-			// Add the newly created namespace to the list of restored items.
-			if nsCreated {
-				itemKey := itemKey{
-					resource:  resourceKey(nsToEnsure),
-					namespace: nsToEnsure.Namespace,
-					name:      nsToEnsure.Name,
-				}
-				ctx.restoredItems[itemKey] = itemRestoreResultCreated
+			return warnings, errs, itemExists
+		}
+		// Add the newly created namespace to the list of restored items.
+		if nsCreated {
+			itemKey := itemKey{
+				resource:  resourceKey(nsToEnsure),
+				namespace: nsToEnsure.Namespace,
+				name:      nsToEnsure.Name,
 			}
+			ctx.restoredItems[itemKey] = restoredItemStatus{action: itemRestoreResultCreated, itemExists: true}
 		}
 	} else {
 		if boolptr.IsSetToFalse(ctx.restore.Spec.IncludeClusterResources) {
-			ctx.log.WithFields(logrus.Fields{
-				"namespace":     obj.GetNamespace(),
-				"name":          obj.GetName(),
-				"groupResource": groupResource.String(),
-			}).Info("Not restoring item because it's cluster-scoped")
-			return warnings, errs
+			restoreLogger.Info("Not restoring item because it's cluster-scoped")
+			return warnings, errs, itemExists
 		}
 	}
 
@@ -974,11 +1183,11 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	complete, err := isCompleted(obj, groupResource)
 	if err != nil {
 		errs.Add(namespace, fmt.Errorf("error checking completion of %q: %v", resourceID, err))
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 	if complete {
 		ctx.log.Infof("%s is complete - skipping", kube.NamespaceAndName(obj))
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 
 	name := obj.GetName()
@@ -989,154 +1198,148 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		namespace: namespace,
 		name:      name,
 	}
-	if _, exists := ctx.restoredItems[itemKey]; exists {
+	if prevRestoredItemStatus, exists := ctx.restoredItems[itemKey]; exists {
 		ctx.log.Infof("Skipping %s because it's already been restored.", resourceID)
-		return warnings, errs
+		itemExists = prevRestoredItemStatus.itemExists
+		return warnings, errs, itemExists
 	}
-	ctx.restoredItems[itemKey] = ""
+	ctx.restoredItems[itemKey] = restoredItemStatus{itemExists: itemExists}
 	defer func() {
+		itemStatus := ctx.restoredItems[itemKey]
 		// the action field is set explicitly
-		if action := ctx.restoredItems[itemKey]; len(action) > 0 {
+		if len(itemStatus.action) > 0 {
 			return
 		}
 		// no action specified, and no warnings and errors
 		if errs.IsEmpty() && warnings.IsEmpty() {
-			ctx.restoredItems[itemKey] = itemRestoreResultSkipped
+			itemStatus.action = itemRestoreResultSkipped
+			ctx.restoredItems[itemKey] = itemStatus
 			return
 		}
 		// others are all failed
-		ctx.restoredItems[itemKey] = itemRestoreResultFailed
+		itemStatus.action = itemRestoreResultFailed
+		ctx.restoredItems[itemKey] = itemStatus
 	}()
 
 	// TODO: move to restore item action if/when we add a ShouldRestore() method
 	// to the interface.
 	if groupResource == kuberesource.Pods && obj.GetAnnotations()[v1.MirrorPodAnnotationKey] != "" {
 		ctx.log.Infof("Not restoring pod because it's a mirror pod")
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 
 	resourceClient, err := ctx.getResourceClient(groupResource, obj, namespace)
 	if err != nil {
 		errs.AddVeleroError(fmt.Errorf("error getting resource client for namespace %q, resource %q: %v", namespace, &groupResource, err))
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 
 	if groupResource == kuberesource.PersistentVolumes {
-		switch {
-		case hasSnapshot(name, ctx.volumeSnapshots):
-			oldName := obj.GetName()
-			shouldRenamePV, err := shouldRenamePV(ctx, obj, resourceClient)
-			if err != nil {
-				errs.Add(namespace, err)
-				return warnings, errs
-			}
+		if volumeInfo, ok := ctx.volumeInfoMap[obj.GetName()]; ok {
+			ctx.log.Infof("Find VolumeInfo for PV %s.", obj.GetName())
 
-			// Check to see if the claimRef.namespace field needs to be remapped,
-			// and do so if necessary.
-			_, err = remapClaimRefNS(ctx, obj)
-			if err != nil {
-				errs.Add(namespace, err)
-				return warnings, errs
-			}
-
-			var shouldRestoreSnapshot bool
-			if !shouldRenamePV {
-				// Check if the PV exists in the cluster before attempting to create
-				// a volume from the snapshot, in order to avoid orphaned volumes (GH #609)
-				shouldRestoreSnapshot, err = ctx.shouldRestore(name, resourceClient)
+			switch volumeInfo.BackupMethod {
+			case internalVolume.NativeSnapshot:
+				obj, err = ctx.handlePVHasNativeSnapshot(obj, resourceClient)
 				if err != nil {
-					errs.Add(namespace, errors.Wrapf(err, "error waiting on in-cluster persistentvolume %s", name))
-					return warnings, errs
+					errs.Add(namespace, err)
+					return warnings, errs, itemExists
 				}
-			} else {
-				// If we're renaming the PV, we're going to give it a new random name,
-				// so we can assume it doesn't already exist in the cluster and therefore
-				// we should proceed with restoring from snapshot.
-				shouldRestoreSnapshot = true
-			}
 
-			if shouldRestoreSnapshot {
-				// Reset the PV's binding status so that Kubernetes can properly
-				// associate it with the restored PVC.
-				obj = resetVolumeBindingInfo(obj)
+				name = obj.GetName()
 
-				// Even if we're renaming the PV, obj still has the old name here, because the pvRestorer
-				// uses the original name to look up metadata about the snapshot.
-				ctx.log.Infof("Restoring persistent volume from snapshot.")
-				updatedObj, err := ctx.pvRestorer.executePVAction(obj)
-				if err != nil {
-					errs.Add(namespace, fmt.Errorf("error executing PVAction for %s: %v", resourceID, err))
-					return warnings, errs
+			case internalVolume.PodVolumeBackup:
+				restoreLogger.Infof("Dynamically re-provisioning persistent volume because it has a pod volume backup to be restored.")
+				ctx.pvsToProvision.Insert(name)
+
+				// Return early because we don't want to restore the PV itself, we
+				// want to dynamically re-provision it.
+				return warnings, errs, itemExists
+
+			case internalVolume.CSISnapshot:
+				restoreLogger.Infof("Dynamically re-provisioning persistent volume because it has a CSI VolumeSnapshot or a related snapshot DataUpload.")
+				ctx.pvsToProvision.Insert(name)
+
+				if ready, err := ctx.featureVerifier.Verify(velerov1api.CSIFeatureFlag); !ready {
+					ctx.log.Errorf("Failed to verify CSI modules, ready %v, err %v", ready, err)
+					errs.Add(namespace, fmt.Errorf("CSI modules are not ready for restore. Check CSI feature is enabled and CSI plugin is installed"))
 				}
-				obj = updatedObj
 
-				// VolumeSnapshotter has modified the PV name, we should rename the PV.
-				if oldName != obj.GetName() {
-					shouldRenamePV = true
-				}
-			}
+				// Return early because we don't want to restore the PV itself, we
+				// want to dynamically re-provision it.
+				return warnings, errs, itemExists
 
-			if shouldRenamePV {
-				var pvName string
-				if oldName == obj.GetName() {
-					// pvRestorer hasn't modified the PV name, we need to rename the PV.
-					pvName, err = ctx.pvRenamer(oldName)
-					if err != nil {
-						errs.Add(namespace, errors.Wrapf(err, "error renaming PV"))
-						return warnings, errs
-					}
+			// When the PV data is skipped from backup, it's VolumeInfo BackupMethod
+			// is not set, and it will fall into the default case.
+			default:
+				if hasDeleteReclaimPolicy(obj.Object) {
+					restoreLogger.Infof("Dynamically re-provisioning persistent volume because it doesn't have a snapshot and its reclaim policy is Delete.")
+					ctx.pvsToProvision.Insert(name)
+
+					// Return early because we don't want to restore the PV itself, we
+					// want to dynamically re-provision it.
+					return warnings, errs, itemExists
 				} else {
-					// VolumeSnapshotter could have modified the PV name through
-					// function `SetVolumeID`,
-					pvName = obj.GetName()
+					obj, err = ctx.handleSkippedPVHasRetainPolicy(obj, resourceID, restoreLogger)
+					if err != nil {
+						errs.Add(namespace, err)
+						return warnings, errs, itemExists
+					}
+				}
+			}
+		} else {
+			// TODO: VolumeInfo is adopted and old logic is deprecated in v1.13.
+			// Remove the old logic in v1.15.
+			ctx.log.Infof("Cannot find VolumeInfo for PV %s.", obj.GetName())
+
+			switch {
+			case hasSnapshot(name, ctx.volumeSnapshots):
+				obj, err = ctx.handlePVHasNativeSnapshot(obj, resourceClient)
+				if err != nil {
+					errs.Add(namespace, err)
+					return warnings, errs, itemExists
 				}
 
-				ctx.renamedPVs[oldName] = pvName
-				obj.SetName(pvName)
+				name = obj.GetName()
 
-				// Add the original PV name as an annotation.
-				annotations := obj.GetAnnotations()
-				if annotations == nil {
-					annotations = map[string]string{}
+			case hasPodVolumeBackup(obj, ctx):
+				restoreLogger.Infof("Dynamically re-provisioning persistent volume because it has a pod volume backup to be restored.")
+				ctx.pvsToProvision.Insert(name)
+
+				// Return early because we don't want to restore the PV itself, we
+				// want to dynamically re-provision it.
+				return warnings, errs, itemExists
+
+			case hasCSIVolumeSnapshot(ctx, obj):
+				fallthrough
+			case hasSnapshotDataUpload(ctx, obj):
+				restoreLogger.Infof("Dynamically re-provisioning persistent volume because it has a CSI VolumeSnapshot or a related snapshot DataUpload.")
+				ctx.pvsToProvision.Insert(name)
+
+				if ready, err := ctx.featureVerifier.Verify(velerov1api.CSIFeatureFlag); !ready {
+					ctx.log.Errorf("Failed to verify CSI modules, ready %v, err %v", ready, err)
+					errs.Add(namespace, fmt.Errorf("CSI modules are not ready for restore. Check CSI feature is enabled and CSI plugin is installed"))
 				}
-				annotations["velero.io/original-pv-name"] = oldName
-				obj.SetAnnotations(annotations)
+
+				// Return early because we don't want to restore the PV itself, we
+				// want to dynamically re-provision it.
+				return warnings, errs, itemExists
+
+			case hasDeleteReclaimPolicy(obj.Object):
+				restoreLogger.Infof("Dynamically re-provisioning persistent volume because it doesn't have a snapshot and its reclaim policy is Delete.")
+				ctx.pvsToProvision.Insert(name)
+
+				// Return early because we don't want to restore the PV itself, we
+				// want to dynamically re-provision it.
+				return warnings, errs, itemExists
+
+			default:
+				obj, err = ctx.handleSkippedPVHasRetainPolicy(obj, resourceID, restoreLogger)
+				if err != nil {
+					errs.Add(namespace, err)
+					return warnings, errs, itemExists
+				}
 			}
-
-		case hasPodVolumeBackup(obj, ctx):
-			ctx.log.Infof("Dynamically re-provisioning persistent volume because it has a pod volume backup to be restored.")
-			ctx.pvsToProvision.Insert(name)
-
-			// Return early because we don't want to restore the PV itself, we
-			// want to dynamically re-provision it.
-			return warnings, errs
-
-		case hasDeleteReclaimPolicy(obj.Object):
-			ctx.log.Infof("Dynamically re-provisioning persistent volume because it doesn't have a snapshot and its reclaim policy is Delete.")
-			ctx.pvsToProvision.Insert(name)
-
-			// Return early because we don't want to restore the PV itself, we
-			// want to dynamically re-provision it.
-			return warnings, errs
-
-		default:
-			ctx.log.Infof("Restoring persistent volume as-is because it doesn't have a snapshot and its reclaim policy is not Delete.")
-
-			// Check to see if the claimRef.namespace field needs to be remapped, and do so if necessary.
-			_, err = remapClaimRefNS(ctx, obj)
-			if err != nil {
-				errs.Add(namespace, err)
-				return warnings, errs
-			}
-			obj = resetVolumeBindingInfo(obj)
-			// We call the pvRestorer here to clear out the PV's claimRef.UID,
-			// so it can be re-claimed when its PVC is restored and gets a new UID.
-			updatedObj, err := ctx.pvRestorer.executePVAction(obj)
-			if err != nil {
-				errs.Add(namespace, fmt.Errorf("error executing PVAction for %s: %v", resourceID, err))
-				return warnings, errs
-			}
-			obj = updatedObj
 		}
 	}
 
@@ -1144,13 +1347,20 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	// Clear out non-core metadata fields and status.
 	if obj, err = resetMetadataAndStatus(obj); err != nil {
 		errs.Add(namespace, err)
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 
 	ctx.log.Infof("restore status includes excludes: %+v", ctx.resourceStatusIncludesExcludes)
 
 	for _, action := range ctx.getApplicableActions(groupResource, namespace) {
 		if !action.Selector.Matches(labels.Set(obj.GetLabels())) {
+			continue
+		}
+
+		// If the EnableCSI feature is not enabled, but the executing action is from CSI plugin, skip the action.
+		if csiutil.ShouldSkipAction(action.Name()) {
+			ctx.log.Infof("Skip action %s for resource %s:%s/%s, because the CSI feature is not enabled. Feature setting is %s.",
+				action.Name(), groupResource.String(), obj.GetNamespace(), obj.GetName(), features.Serialize())
 			continue
 		}
 
@@ -1162,21 +1372,46 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		})
 		if err != nil {
 			errs.Add(namespace, fmt.Errorf("error preparing %s: %v", resourceID, err))
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 
+		// If async plugin started async operation, add it to the ItemOperations list
+		if executeOutput.OperationID != "" {
+			resourceIdentifier := velero.ResourceIdentifier{
+				GroupResource: groupResource,
+				Namespace:     namespace,
+				Name:          name,
+			}
+			now := metav1.Now()
+			newOperation := itemoperation.RestoreOperation{
+				Spec: itemoperation.RestoreOperationSpec{
+					RestoreName:        ctx.restore.Name,
+					RestoreUID:         string(ctx.restore.UID),
+					RestoreItemAction:  action.RestoreItemAction.Name(),
+					ResourceIdentifier: resourceIdentifier,
+					OperationID:        executeOutput.OperationID,
+				},
+				Status: itemoperation.OperationStatus{
+					Phase:   itemoperation.OperationPhaseNew,
+					Created: &now,
+				},
+			}
+			itemOperList := ctx.itemOperationsList
+			*itemOperList = append(*itemOperList, &newOperation)
+		}
 		if executeOutput.SkipRestore {
 			ctx.log.Infof("Skipping restore of %s: %v because a registered plugin discarded it", obj.GroupVersionKind().Kind, name)
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 		unstructuredObj, ok := executeOutput.UpdatedItem.(*unstructured.Unstructured)
 		if !ok {
 			errs.Add(namespace, fmt.Errorf("%s: unexpected type %T", resourceID, executeOutput.UpdatedItem))
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 
 		obj = unstructuredObj
 
+		var filteredAdditionalItems []velero.ResourceIdentifier
 		for _, additionalItem := range executeOutput.AdditionalItems {
 			itemPath := archive.GetItemFilePath(ctx.restoreDir, additionalItem.GroupResource.String(), additionalItem.Namespace, additionalItem.Name)
 
@@ -1204,9 +1439,20 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				}
 			}
 
-			w, e := ctx.restoreItem(additionalObj, additionalItem.GroupResource, additionalItemNamespace)
+			w, e, additionalItemExists := ctx.restoreItem(additionalObj, additionalItem.GroupResource, additionalItemNamespace)
+			if additionalItemExists {
+				filteredAdditionalItems = append(filteredAdditionalItems, additionalItem)
+			}
+
 			warnings.Merge(&w)
 			errs.Merge(&e)
+		}
+		executeOutput.AdditionalItems = filteredAdditionalItems
+		available, err := ctx.itemsAvailable(action, executeOutput)
+		if err != nil {
+			errs.Add(namespace, errors.Wrapf(err, "error verifying additional items are ready to use"))
+		} else if !available {
+			errs.Add(namespace, fmt.Errorf("additional items for %s are not ready to use", resourceID))
 		}
 	}
 
@@ -1222,7 +1468,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		pvc := new(v1.PersistentVolumeClaim)
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pvc); err != nil {
 			errs.Add(namespace, err)
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 
 		if pvc.Spec.VolumeName != "" {
@@ -1241,7 +1487,15 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 			ctx.log.Infof("Updating persistent volume claim %s/%s to reference renamed persistent volume (%s -> %s)", namespace, name, pvc.Spec.VolumeName, newName)
 			if err := unstructured.SetNestedField(obj.Object, newName, "spec", "volumeName"); err != nil {
 				errs.Add(namespace, err)
-				return warnings, errs
+				return warnings, errs, itemExists
+			}
+		}
+	}
+
+	if ctx.resourceModifiers != nil {
+		if errList := ctx.resourceModifiers.ApplyResourceModifierRules(obj, groupResource.String(), ctx.kbClient.Scheme(), ctx.log); errList != nil {
+			for _, err := range errList {
+				errs.Add(namespace, err)
 			}
 		}
 	}
@@ -1258,41 +1512,71 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	// and which backup they came from.
 	addRestoreLabels(obj, ctx.restore.Name, ctx.restore.Spec.BackupName)
 
-	ctx.log.Infof("Attempting to restore %s: %v", obj.GroupVersionKind().Kind, name)
-	createdObj, restoreErr := resourceClient.Create(obj)
-	if restoreErr == nil {
-		ctx.restoredItems[itemKey] = itemRestoreResultCreated
-	}
-	isAlreadyExistsError, err := isAlreadyExistsError(ctx, obj, restoreErr, resourceClient)
+	// The object apiVersion might get modified by a RestorePlugin so we need to
+	// get a new client to reflect updated resource path.
+	newGR := schema.GroupResource{Group: obj.GroupVersionKind().Group, Resource: groupResource.Resource}
+	resourceClient, err = ctx.getResourceClient(newGR, obj, obj.GetNamespace())
 	if err != nil {
-		errs.Add(namespace, err)
-		return warnings, errs
+		errs.AddVeleroError(fmt.Errorf("error getting updated resource client for namespace %q, resource %q: %v", namespace, &groupResource, err))
+		return warnings, errs, itemExists
 	}
+
+	ctx.log.Infof("Attempting to restore %s: %v", obj.GroupVersionKind().Kind, name)
 
 	// check if we want to treat the error as a warning, in some cases the creation call might not get executed due to object API validations
 	// and Velero might not get the already exists error type but in reality the object already exists
-	var fromCluster *unstructured.Unstructured
+	var fromCluster, createdObj *unstructured.Unstructured
+	var restoreErr error
+
+	// only attempt Get before Create if using informer cache, otherwise this will slow down restore into
+	// new namespace
+	if !ctx.disableInformerCache {
+		ctx.log.Debugf("Checking for existence %s: %v", obj.GroupVersionKind().Kind, name)
+		fromCluster, err = ctx.getResource(groupResource, obj, namespace, name)
+	}
+	if err != nil || fromCluster == nil {
+		// couldn't find the resource, attempt to create
+		ctx.log.Debugf("Creating %s: %v", obj.GroupVersionKind().Kind, name)
+		createdObj, restoreErr = resourceClient.Create(obj)
+		if restoreErr == nil {
+			itemExists = true
+			ctx.restoredItems[itemKey] = restoredItemStatus{action: itemRestoreResultCreated, itemExists: itemExists}
+		}
+	}
+
+	isAlreadyExistsError, err := isAlreadyExistsError(ctx, obj, restoreErr, resourceClient)
+	if err != nil {
+		errs.Add(namespace, err)
+		return warnings, errs, itemExists
+	}
 
 	if restoreErr != nil {
-		// check for the existence of the object in cluster, if no error then it implies that object exists
-		// and if err then we want to judge whether there is an existing error in the previous creation.
-		// if so, we will return the 'get' error.
-		// otherwise, we will return the original creation error.
-		fromCluster, err = resourceClient.Get(name, metav1.GetOptions{})
+		// check for the existence of the object that failed creation due to alreadyExist in cluster, if no error then it implies that object exists.
+		// and if err then itemExists remains false as we were not able to confirm the existence of the object via Get call or creation call.
+		// We return the get error as a warning to notify the user that the object could exist in cluster and we were not able to confirm it.
+		if !ctx.disableInformerCache {
+			fromCluster, err = ctx.getResource(groupResource, obj, namespace, name)
+		} else {
+			fromCluster, err = resourceClient.Get(name, metav1.GetOptions{})
+		}
 		if err != nil && isAlreadyExistsError {
-			ctx.log.Errorf("Error retrieving in-cluster version of %s: %v", kube.NamespaceAndName(obj), err)
-			errs.Add(namespace, err)
-			return warnings, errs
+			ctx.log.Warnf("Unable to retrieve in-cluster version of %s: %v, object won't be restored by velero or have restore labels, and existing resource policy is not applied", kube.NamespaceAndName(obj), err)
+			warnings.Add(namespace, err)
+			return warnings, errs, itemExists
 		}
 	}
 
 	if fromCluster != nil {
+		itemExists = true
+		itemStatus := ctx.restoredItems[itemKey]
+		itemStatus.itemExists = itemExists
+		ctx.restoredItems[itemKey] = itemStatus
 		// Remove insubstantial metadata.
 		fromCluster, err = resetMetadataAndStatus(fromCluster)
 		if err != nil {
 			ctx.log.Infof("Error trying to reset metadata for %s: %v", kube.NamespaceAndName(obj), err)
 			warnings.Add(namespace, err)
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 
 		// We know the object from the cluster won't have the backup/restore name
@@ -1308,20 +1592,20 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				if err != nil {
 					ctx.log.Infof("error merging secrets for ServiceAccount %s: %v", kube.NamespaceAndName(obj), err)
 					warnings.Add(namespace, err)
-					return warnings, errs
+					return warnings, errs, itemExists
 				}
 
 				patchBytes, err := generatePatch(fromCluster, desired)
 				if err != nil {
 					ctx.log.Infof("error generating patch for ServiceAccount %s: %v", kube.NamespaceAndName(obj), err)
 					warnings.Add(namespace, err)
-					return warnings, errs
+					return warnings, errs, itemExists
 				}
 
 				if patchBytes == nil {
 					// In-cluster and desired state are the same, so move on to
 					// the next item.
-					return warnings, errs
+					return warnings, errs, itemExists
 				}
 
 				_, err = resourceClient.Patch(name, patchBytes)
@@ -1337,7 +1621,8 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 						errs.Merge(&errsFromUpdate)
 					}
 				} else {
-					ctx.restoredItems[itemKey] = itemRestoreResultUpdated
+					itemStatus.action = itemRestoreResultUpdated
+					ctx.restoredItems[itemKey] = itemStatus
 					ctx.log.Infof("ServiceAccount %s successfully updated", kube.NamespaceAndName(obj))
 				}
 			default:
@@ -1348,7 +1633,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 
 					// existingResourcePolicy is set as none, add warning
 					if resourcePolicy == velerov1api.PolicyTypeNone {
-						e := errors.Errorf("could not restore, %s %q already exists. Warning: the in-cluster version is different than the backed-up version.",
+						e := errors.Errorf("could not restore, %s %q already exists. Warning: the in-cluster version is different than the backed-up version",
 							obj.GetKind(), obj.GetName())
 						warnings.Add(namespace, e)
 						// existingResourcePolicy is set as update, attempt patch on the resource and add warning if it fails
@@ -1356,19 +1641,20 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 						// processing update as existingResourcePolicy
 						warningsFromUpdateRP, errsFromUpdateRP := ctx.processUpdateResourcePolicy(fromCluster, fromClusterWithLabels, obj, namespace, resourceClient)
 						if warningsFromUpdateRP.IsEmpty() && errsFromUpdateRP.IsEmpty() {
-							ctx.restoredItems[itemKey] = itemRestoreResultUpdated
+							itemStatus.action = itemRestoreResultUpdated
+							ctx.restoredItems[itemKey] = itemStatus
 						}
 						warnings.Merge(&warningsFromUpdateRP)
 						errs.Merge(&errsFromUpdateRP)
 					}
 				} else {
 					// Preserved Velero behavior when existingResourcePolicy is not specified by the user
-					e := errors.Errorf("could not restore, %s %q already exists. Warning: the in-cluster version is different than the backed-up version.",
+					e := errors.Errorf("could not restore, %s %q already exists. Warning: the in-cluster version is different than the backed-up version",
 						obj.GetKind(), obj.GetName())
 					warnings.Add(namespace, e)
 				}
 			}
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 
 		//update backup/restore labels on the unchanged resources if existingResourcePolicy is set as update
@@ -1384,14 +1670,14 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		}
 
 		ctx.log.Infof("Restore of %s, %v skipped: it already exists in the cluster and is the same as the backed up version", obj.GroupVersionKind().Kind, name)
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 
 	// Error was something other than an AlreadyExists.
 	if restoreErr != nil {
 		ctx.log.Errorf("error restoring %s: %+v", name, restoreErr)
 		errs.Add(namespace, fmt.Errorf("error restoring %s: %v", resourceID, restoreErr))
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 
 	shouldRestoreStatus := ctx.resourceStatusIncludesExcludes != nil && ctx.resourceStatusIncludesExcludes.ShouldInclude(groupResource.String())
@@ -1399,7 +1685,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		err := fmt.Errorf("could not get status to be restored %s: %v", kube.NamespaceAndName(obj), statusFieldErr)
 		ctx.log.Errorf(err.Error())
 		errs.Add(namespace, err)
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 	ctx.log.Debugf("status field for %s: exists: %v, should restore: %v", groupResource, statusFieldExists, shouldRestoreStatus)
 	// if it should restore status, run a UpdateStatus
@@ -1407,7 +1693,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		if err := unstructured.SetNestedField(obj.Object, objStatus, "status"); err != nil {
 			ctx.log.Errorf("could not set status field %s: %v", kube.NamespaceAndName(obj), err)
 			errs.Add(namespace, err)
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 		obj.SetResourceVersion(createdObj.GetResourceVersion())
 		updated, err := resourceClient.UpdateStatus(obj, metav1.UpdateOptions{})
@@ -1426,22 +1712,25 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	if err != nil {
 		ctx.log.Errorf("error generating patch for managed fields %s: %v", kube.NamespaceAndName(obj), err)
 		errs.Add(namespace, err)
-		return warnings, errs
+		return warnings, errs, itemExists
 	}
 	if patchBytes != nil {
 		if _, err = resourceClient.Patch(name, patchBytes); err != nil {
 			ctx.log.Errorf("error patch for managed fields %s: %v", kube.NamespaceAndName(obj), err)
-			errs.Add(namespace, err)
-			return warnings, errs
+			if !apierrors.IsNotFound(err) {
+				errs.Add(namespace, err)
+				return warnings, errs, itemExists
+			}
+		} else {
+			ctx.log.Infof("the managed fields for %s is patched", kube.NamespaceAndName(obj))
 		}
-		ctx.log.Infof("the managed fields for %s is patched", kube.NamespaceAndName(obj))
 	}
 
 	if groupResource == kuberesource.Pods {
 		pod := new(v1.Pod)
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pod); err != nil {
 			errs.Add(namespace, err)
-			return warnings, errs
+			return warnings, errs, itemExists
 		}
 
 		// Do not create podvolumerestore when current restore excludes pv/pvc
@@ -1463,11 +1752,11 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		if err != nil {
 			errs.Add(namespace, errors.Wrapf(err, "error verifying custom resource definition is ready to use"))
 		} else if !available {
-			errs.Add(namespace, fmt.Errorf("CRD %s is not available to use for custom resources.", name))
+			errs.Add(namespace, fmt.Errorf("the CRD %s is not available to use for custom resources", name))
 		}
 	}
 
-	return warnings, errs
+	return warnings, errs, itemExists
 }
 
 func isAlreadyExistsError(ctx *restoreContext, obj *unstructured.Unstructured, err error, client client.Dynamic) (bool, error) {
@@ -1551,7 +1840,7 @@ func shouldRenamePV(ctx *restoreContext, obj *unstructured.Unstructured, client 
 // remapClaimRefNS remaps a PersistentVolume's claimRef.Namespace based on a
 // restore's NamespaceMappings, if necessary. Returns true if the namespace was
 // remapped, false if it was not required.
-func remapClaimRefNS(ctx *restoreContext, obj *unstructured.Unstructured) (bool, error) { //nolint:unparam
+func remapClaimRefNS(ctx *restoreContext, obj *unstructured.Unstructured) (bool, error) { //nolint:unparam // ignore the result 0 (bool) is never used warning.
 	if len(ctx.restore.Spec.NamespaceMapping) == 0 {
 		ctx.log.Debug("Persistent volume does not need to have the claimRef.namespace remapped because restore is not remapping any namespaces")
 		return false, nil
@@ -1628,30 +1917,32 @@ func (ctx *restoreContext) waitExec(createdObj *unstructured.Unstructured) {
 		// on the ctx.podVolumeErrs channel.
 		defer ctx.hooksWaitGroup.Done()
 
+		podNs := createdObj.GetNamespace()
 		pod := new(v1.Pod)
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(createdObj.UnstructuredContent(), &pod); err != nil {
 			ctx.log.WithError(err).Error("error converting unstructured pod")
-			ctx.hooksErrs <- err
+			ctx.hooksErrs <- hook.HookErrInfo{Namespace: podNs, Err: err}
 			return
 		}
 		execHooksByContainer, err := hook.GroupRestoreExecHooks(
 			ctx.resourceRestoreHooks,
 			pod,
 			ctx.log,
+			ctx.hookTracker,
 		)
 		if err != nil {
 			ctx.log.WithError(err).Errorf("error getting exec hooks for pod %s/%s", pod.Namespace, pod.Name)
-			ctx.hooksErrs <- err
+			ctx.hooksErrs <- hook.HookErrInfo{Namespace: podNs, Err: err}
 			return
 		}
 
-		if errs := ctx.waitExecHookHandler.HandleHooks(ctx.hooksContext, ctx.log, pod, execHooksByContainer); len(errs) > 0 {
+		if errs := ctx.waitExecHookHandler.HandleHooks(ctx.hooksContext, ctx.log, pod, execHooksByContainer, ctx.hookTracker); len(errs) > 0 {
 			ctx.log.WithError(kubeerrs.NewAggregate(errs)).Error("unable to successfully execute post-restore hooks")
 			ctx.hooksCancelFunc()
 
 			for _, err := range errs {
 				// Errors are already logged in the HandleHooks method.
-				ctx.hooksErrs <- err
+				ctx.hooksErrs <- hook.HookErrInfo{Namespace: podNs, Err: err}
 			}
 		}
 	}()
@@ -1665,6 +1956,55 @@ func hasSnapshot(pvName string, snapshots []*volume.Snapshot) bool {
 	}
 
 	return false
+}
+
+func hasCSIVolumeSnapshot(ctx *restoreContext, unstructuredPV *unstructured.Unstructured) bool {
+	pv := new(v1.PersistentVolume)
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredPV.Object, pv); err != nil {
+		ctx.log.WithError(err).Warnf("Unable to convert PV from unstructured to structured")
+		return false
+	}
+
+	for _, vs := range ctx.csiVolumeSnapshots {
+		if pv.Spec.ClaimRef.Name == *vs.Spec.Source.PersistentVolumeClaimName &&
+			pv.Spec.ClaimRef.Namespace == vs.Namespace {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSnapshotDataUpload(ctx *restoreContext, unstructuredPV *unstructured.Unstructured) bool {
+	pv := new(v1.PersistentVolume)
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredPV.Object, pv); err != nil {
+		ctx.log.WithError(err).Warnf("Unable to convert PV from unstructured to structured")
+		return false
+	}
+
+	if pv.Spec.ClaimRef == nil {
+		return false
+	}
+
+	dataUploadResultList := new(v1.ConfigMapList)
+	err := ctx.kbClient.List(go_context.TODO(), dataUploadResultList, &crclient.ListOptions{
+		LabelSelector: labels.SelectorFromSet(map[string]string{
+			velerov1api.RestoreUIDLabel:       label.GetValidName(string(ctx.restore.GetUID())),
+			velerov1api.PVCNamespaceNameLabel: label.GetValidName(pv.Spec.ClaimRef.Namespace + "." + pv.Spec.ClaimRef.Name),
+			velerov1api.ResourceUsageLabel:    label.GetValidName(string(velerov1api.VeleroResourceUsageDataUploadResult)),
+		}),
+	})
+	if err != nil {
+		ctx.log.WithError(err).Warnf("Fail to list DataUpload result CM.")
+		return false
+	}
+
+	if len(dataUploadResultList.Items) != 1 {
+		ctx.log.WithError(fmt.Errorf("dataupload result number is not expected")).
+			Warnf("Got %d DataUpload result. Expect one.", len(dataUploadResultList.Items))
+		return false
+	}
+
+	return true
 }
 
 func hasPodVolumeBackup(unstructuredPV *unstructured.Unstructured, ctx *restoreContext) bool {
@@ -1814,6 +2154,7 @@ type restoreableItem struct {
 	path            string
 	targetNamespace string
 	name            string
+	version         string // used for initializing informer cache
 }
 
 // getOrderedResourceCollection iterates over list of ordered resource
@@ -1826,8 +2167,8 @@ func (ctx *restoreContext) getOrderedResourceCollection(
 	processedResources sets.String,
 	resourcePriorities Priorities,
 	includeAllResources bool,
-) ([]restoreableResource, sets.String, Result, Result) {
-	var warnings, errs Result
+) ([]restoreableResource, sets.String, results.Result, results.Result) {
+	var warnings, errs results.Result
 	// Iterate through an ordered list of resources to restore, checking each
 	// one to see if it should be restored. Note that resources *may* be in this
 	// list twice, i.e. once due to being a prioritized resource, and once due
@@ -1873,12 +2214,6 @@ func (ctx *restoreContext) getOrderedResourceCollection(
 			continue
 		}
 
-		// We don't want to explicitly restore namespace API objs because we'll handle
-		// them as a special case prior to restoring anything into them
-		if groupResource == kuberesource.Namespaces {
-			continue
-		}
-
 		// Check if the resource is present in the backup
 		resourceList := backupResources[groupResource.String()]
 		if resourceList == nil {
@@ -1889,29 +2224,22 @@ func (ctx *restoreContext) getOrderedResourceCollection(
 		// Iterate through each namespace that contains instances of the
 		// resource and append to the list of to-be restored resources.
 		for namespace, items := range resourceList.ItemsByNamespace {
-			if namespace != "" && !ctx.namespaceIncludesExcludes.ShouldInclude(namespace) {
+			if namespace != "" && !ctx.namespaceIncludesExcludes.ShouldInclude(namespace) && !ctx.resourceMustHave.Has(groupResource.String()) {
 				ctx.log.Infof("Skipping namespace %s", namespace)
 				continue
 			}
 
-			// get target namespace to restore into, if different
-			// from source namespace
-			targetNamespace := namespace
-			if target, ok := ctx.restore.Spec.NamespaceMapping[namespace]; ok {
-				targetNamespace = target
-			}
-
-			if targetNamespace == "" && boolptr.IsSetToFalse(ctx.restore.Spec.IncludeClusterResources) {
+			if namespace == "" && boolptr.IsSetToFalse(ctx.restore.Spec.IncludeClusterResources) {
 				ctx.log.Infof("Skipping resource %s because it's cluster-scoped", resource)
 				continue
 			}
 
-			if targetNamespace == "" && !boolptr.IsSetToTrue(ctx.restore.Spec.IncludeClusterResources) && !ctx.namespaceIncludesExcludes.IncludeEverything() {
+			if namespace == "" && !boolptr.IsSetToTrue(ctx.restore.Spec.IncludeClusterResources) && !ctx.namespaceIncludesExcludes.IncludeEverything() {
 				ctx.log.Infof("Skipping resource %s because it's cluster-scoped and only specific namespaces are included in the restore", resource)
 				continue
 			}
 
-			res, w, e := ctx.getSelectedRestoreableItems(groupResource.String(), targetNamespace, namespace, items)
+			res, w, e := ctx.getSelectedRestoreableItems(groupResource.String(), ctx.restore.Spec.NamespaceMapping, namespace, items)
 			warnings.Merge(&w)
 			errs.Merge(&e)
 
@@ -1927,8 +2255,8 @@ func (ctx *restoreContext) getOrderedResourceCollection(
 // getSelectedRestoreableItems applies Kubernetes selectors on individual items
 // of each resource type to create a list of items which will be actually
 // restored.
-func (ctx *restoreContext) getSelectedRestoreableItems(resource, targetNamespace, originalNamespace string, items []string) (restoreableResource, Result, Result) {
-	warnings, errs := Result{}, Result{}
+func (ctx *restoreContext) getSelectedRestoreableItems(resource string, namespaceMapping map[string]string, originalNamespace string, items []string) (restoreableResource, results.Result, results.Result) { //nolint:unparam // Ignore the warnings is always nil warning.
+	warnings, errs := results.Result{}, results.Result{}
 
 	restorable := restoreableResource{
 		resource: resource,
@@ -1938,12 +2266,18 @@ func (ctx *restoreContext) getSelectedRestoreableItems(resource, targetNamespace
 		restorable.selectedItemsByNamespace = make(map[string][]restoreableItem)
 	}
 
+	targetNamespace := originalNamespace
+	if target, ok := namespaceMapping[originalNamespace]; ok {
+		targetNamespace = target
+	}
+
 	if targetNamespace != "" {
 		ctx.log.Infof("Resource '%s' will be restored into namespace '%s'", resource, targetNamespace)
 	} else {
 		ctx.log.Infof("Resource '%s' will be restored at cluster scope", resource)
 	}
 
+	resourceForPath := resource
 	// If the APIGroupVersionsFeatureFlag is enabled, the item path will be
 	// updated to include the API group version that was chosen for restore. For
 	// example, for "horizontalpodautoscalers.autoscaling", if v2beta1 is chosen
@@ -1955,11 +2289,11 @@ func (ctx *restoreContext) getSelectedRestoreableItems(resource, targetNamespace
 	// required backup format version has been met.
 	cgv, ok := ctx.chosenGrpVersToRestore[resource]
 	if ok {
-		resource = filepath.Join(resource, cgv.Dir)
+		resourceForPath = filepath.Join(resource, cgv.Dir)
 	}
 
 	for _, item := range items {
-		itemPath := archive.GetItemFilePath(ctx.restoreDir, resource, originalNamespace, item)
+		itemPath := archive.GetItemFilePath(ctx.restoreDir, resourceForPath, originalNamespace, item)
 
 		obj, err := archive.Unmarshal(ctx.fileSystem, itemPath)
 		if err != nil {
@@ -1999,10 +2333,20 @@ func (ctx *restoreContext) getSelectedRestoreableItems(resource, targetNamespace
 			continue
 		}
 
+		if resource == kuberesource.Namespaces.String() {
+			// handle remapping for namespace resource
+			if target, ok := namespaceMapping[item]; ok {
+				targetNamespace = target
+			} else {
+				targetNamespace = item
+			}
+		}
+
 		selectedItem := restoreableItem{
 			path:            itemPath,
 			name:            item,
 			targetNamespace: targetNamespace,
+			version:         obj.GroupVersionKind().Version,
 		}
 		restorable.selectedItemsByNamespace[originalNamespace] =
 			append(restorable.selectedItemsByNamespace[originalNamespace], selectedItem)
@@ -2027,7 +2371,7 @@ func removeRestoreLabels(obj metav1.Object) {
 }
 
 // updates the backup/restore labels
-func (ctx *restoreContext) updateBackupRestoreLabels(fromCluster, fromClusterWithLabels *unstructured.Unstructured, namespace string, resourceClient client.Dynamic) (warnings, errs Result) {
+func (ctx *restoreContext) updateBackupRestoreLabels(fromCluster, fromClusterWithLabels *unstructured.Unstructured, namespace string, resourceClient client.Dynamic) (warnings, errs results.Result) { //nolint:unparam // Ignore the warnings is nil warning.
 	patchBytes, err := generatePatch(fromCluster, fromClusterWithLabels)
 	if err != nil {
 		ctx.log.Errorf("error generating patch for %s %s: %v", fromCluster.GroupVersionKind().Kind, kube.NamespaceAndName(fromCluster), err)
@@ -2055,7 +2399,7 @@ func (ctx *restoreContext) updateBackupRestoreLabels(fromCluster, fromClusterWit
 
 // function to process existingResourcePolicy as update, tries to patch the diff between in-cluster and restore obj first
 // if the patch fails then tries to update the backup/restore labels for the in-cluster version
-func (ctx *restoreContext) processUpdateResourcePolicy(fromCluster, fromClusterWithLabels, obj *unstructured.Unstructured, namespace string, resourceClient client.Dynamic) (warnings, errs Result) {
+func (ctx *restoreContext) processUpdateResourcePolicy(fromCluster, fromClusterWithLabels, obj *unstructured.Unstructured, namespace string, resourceClient client.Dynamic) (warnings, errs results.Result) {
 	ctx.log.Infof("restore API has existingResourcePolicy defined as update , executing restore workflow accordingly for changed resource %s %s ", obj.GroupVersionKind().Kind, kube.NamespaceAndName(fromCluster))
 	ctx.log.Infof("attempting patch on %s %q", fromCluster.GetKind(), fromCluster.GetName())
 	// remove restore labels so that we apply the latest backup/restore names on the object via patch
@@ -2087,4 +2431,106 @@ func (ctx *restoreContext) processUpdateResourcePolicy(fromCluster, fromClusterW
 		ctx.log.Infof("%s %s successfully updated", obj.GroupVersionKind().Kind, kube.NamespaceAndName(obj))
 	}
 	return warnings, errs
+}
+
+func (ctx *restoreContext) handlePVHasNativeSnapshot(obj *unstructured.Unstructured, resourceClient client.Dynamic) (*unstructured.Unstructured, error) {
+	retObj := obj.DeepCopy()
+	oldName := obj.GetName()
+	shouldRenamePV, err := shouldRenamePV(ctx, retObj, resourceClient)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check to see if the claimRef.namespace field needs to be remapped,
+	// and do so if necessary.
+	_, err = remapClaimRefNS(ctx, retObj)
+	if err != nil {
+		return nil, err
+	}
+
+	var shouldRestoreSnapshot bool
+	if !shouldRenamePV {
+		// Check if the PV exists in the cluster before attempting to create
+		// a volume from the snapshot, in order to avoid orphaned volumes (GH #609)
+		shouldRestoreSnapshot, err = ctx.shouldRestore(oldName, resourceClient)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error waiting on in-cluster persistentvolume %s", oldName)
+		}
+	} else {
+		// If we're renaming the PV, we're going to give it a new random name,
+		// so we can assume it doesn't already exist in the cluster and therefore
+		// we should proceed with restoring from snapshot.
+		shouldRestoreSnapshot = true
+	}
+
+	if shouldRestoreSnapshot {
+		// Reset the PV's binding status so that Kubernetes can properly
+		// associate it with the restored PVC.
+		retObj = resetVolumeBindingInfo(retObj)
+
+		// Even if we're renaming the PV, obj still has the old name here, because the pvRestorer
+		// uses the original name to look up metadata about the snapshot.
+		ctx.log.Infof("Restoring persistent volume from snapshot.")
+		retObj, err = ctx.pvRestorer.executePVAction(retObj)
+		if err != nil {
+			return nil, fmt.Errorf("error executing PVAction for %s: %v", getResourceID(kuberesource.PersistentVolumes, "", oldName), err)
+		}
+
+		// VolumeSnapshotter has modified the PV name, we should rename the PV.
+		if oldName != retObj.GetName() {
+			shouldRenamePV = true
+		}
+	}
+
+	if shouldRenamePV {
+		var pvName string
+		if oldName == retObj.GetName() {
+			// pvRestorer hasn't modified the PV name, we need to rename the PV.
+			pvName, err = ctx.pvRenamer(oldName)
+			if err != nil {
+				return nil, errors.Wrapf(err, "error renaming PV")
+			}
+		} else {
+			// VolumeSnapshotter could have modified the PV name through
+			// function `SetVolumeID`,
+			pvName = retObj.GetName()
+		}
+
+		ctx.renamedPVs[oldName] = pvName
+		retObj.SetName(pvName)
+
+		// Add the original PV name as an annotation.
+		annotations := retObj.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations["velero.io/original-pv-name"] = oldName
+		retObj.SetAnnotations(annotations)
+	}
+
+	return retObj, nil
+}
+
+func (ctx *restoreContext) handleSkippedPVHasRetainPolicy(
+	obj *unstructured.Unstructured,
+	resourceID string,
+	logger logrus.FieldLogger,
+) (*unstructured.Unstructured, error) {
+	logger.Infof("Restoring persistent volume as-is because it doesn't have a snapshot and its reclaim policy is not Delete.")
+
+	// Check to see if the claimRef.namespace field needs to be remapped, and do so if necessary.
+	if _, err := remapClaimRefNS(ctx, obj); err != nil {
+		return nil, err
+	}
+
+	obj = resetVolumeBindingInfo(obj)
+
+	// We call the pvRestorer here to clear out the PV's claimRef.UID,
+	// so it can be re-claimed when its PVC is restored and gets a new UID.
+	updatedObj, err := ctx.pvRestorer.executePVAction(obj)
+	if err != nil {
+		return nil, fmt.Errorf("error executing PVAction for %s: %v", resourceID, err)
+	}
+
+	return updatedObj, nil
 }

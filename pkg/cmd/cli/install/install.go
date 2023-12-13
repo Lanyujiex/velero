@@ -18,7 +18,6 @@ package install
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,8 +40,8 @@ import (
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
-// InstallOptions collects all the options for installing Velero into a Kubernetes cluster.
-type InstallOptions struct {
+// Options collects all the options for installing Velero into a Kubernetes cluster.
+type Options struct {
 	Namespace                 string
 	Image                     string
 	BucketName                string
@@ -67,12 +66,14 @@ type InstallOptions struct {
 	BackupStorageConfig       flag.Map
 	VolumeSnapshotConfig      flag.Map
 	UseNodeAgent              bool
+	PrivilegedNodeAgent       bool
 	//TODO remove UseRestic when migration test out of using it
 	UseRestic                       bool
 	Wait                            bool
 	UseVolumeSnapshots              bool
 	DefaultRepoMaintenanceFrequency time.Duration
 	GarbageCollectionFrequency      time.Duration
+	PodVolumeOperationTimeout       time.Duration
 	Plugins                         flag.StringArray
 	NoDefaultBackupLocation         bool
 	CRDsOnly                        bool
@@ -80,10 +81,13 @@ type InstallOptions struct {
 	Features                        string
 	DefaultVolumesToFsBackup        bool
 	UploaderType                    string
+	DefaultSnapshotMoveData         bool
+	DisableInformerCache            bool
+	ScheduleSkipImmediately         bool
 }
 
 // BindFlags adds command line values to the options struct.
-func (o *InstallOptions) BindFlags(flags *pflag.FlagSet) {
+func (o *Options) BindFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&o.ProviderName, "provider", o.ProviderName, "Provider name for backup and volume storage")
 	flags.StringVar(&o.BucketName, "bucket", o.BucketName, "Name of the object storage bucket where backups should be stored")
 	flags.StringVar(&o.SecretFile, "secret-file", o.SecretFile, "File containing credentials for backup and volume provider. If not specified, --no-secret must be used for confirmation. Optional.")
@@ -110,20 +114,25 @@ func (o *InstallOptions) BindFlags(flags *pflag.FlagSet) {
 	flags.BoolVar(&o.RestoreOnly, "restore-only", o.RestoreOnly, "Run the server in restore-only mode. Optional.")
 	flags.BoolVar(&o.DryRun, "dry-run", o.DryRun, "Generate resources, but don't send them to the cluster. Use with -o. Optional.")
 	flags.BoolVar(&o.UseNodeAgent, "use-node-agent", o.UseNodeAgent, "Create Velero node-agent daemonset. Optional. Velero node-agent hosts Velero modules that need to run in one or more nodes(i.e. Restic, Kopia).")
+	flags.BoolVar(&o.PrivilegedNodeAgent, "privileged-node-agent", o.PrivilegedNodeAgent, "Use privileged mode for the node agent. Optional. Required to backup block devices.")
 	flags.BoolVar(&o.Wait, "wait", o.Wait, "Wait for Velero deployment to be ready. Optional.")
 	flags.DurationVar(&o.DefaultRepoMaintenanceFrequency, "default-repo-maintain-frequency", o.DefaultRepoMaintenanceFrequency, "How often 'maintain' is run for backup repositories by default. Optional.")
 	flags.DurationVar(&o.GarbageCollectionFrequency, "garbage-collection-frequency", o.GarbageCollectionFrequency, "How often the garbage collection runs for expired backups.(default 1h)")
+	flags.DurationVar(&o.PodVolumeOperationTimeout, "pod-volume-operation-timeout", o.PodVolumeOperationTimeout, "How long to wait for pod volume operations to complete before timing out(default 4h). Optional.")
 	flags.Var(&o.Plugins, "plugins", "Plugin container images to install into the Velero Deployment")
 	flags.BoolVar(&o.CRDsOnly, "crds-only", o.CRDsOnly, "Only generate CustomResourceDefinition resources. Useful for updating CRDs for an existing Velero install.")
 	flags.StringVar(&o.CACertFile, "cacert", o.CACertFile, "File containing a certificate bundle to use when verifying TLS connections to the object store. Optional.")
 	flags.StringVar(&o.Features, "features", o.Features, "Comma separated list of Velero feature flags to be set on the Velero deployment and the node-agent daemonset, if node-agent is enabled")
 	flags.BoolVar(&o.DefaultVolumesToFsBackup, "default-volumes-to-fs-backup", o.DefaultVolumesToFsBackup, "Bool flag to configure Velero server to use pod volume file system backup by default for all volumes on all backups. Optional.")
 	flags.StringVar(&o.UploaderType, "uploader-type", o.UploaderType, fmt.Sprintf("The type of uploader to transfer the data of pod volumes, the supported values are '%s', '%s'", uploader.ResticType, uploader.KopiaType))
+	flags.BoolVar(&o.DefaultSnapshotMoveData, "default-snapshot-move-data", o.DefaultSnapshotMoveData, "Bool flag to configure Velero server to move data by default for all snapshots supporting data movement. Optional.")
+	flags.BoolVar(&o.DisableInformerCache, "disable-informer-cache", o.DisableInformerCache, "Disable informer cache for Get calls on restore. With this enabled, it will speed up restore in cases where there are backup resources which already exist in the cluster, but for very large clusters this will increase velero memory usage. Default is false (don't disable). Optional.")
+	flags.BoolVar(&o.ScheduleSkipImmediately, "schedule-skip-immediately", o.ScheduleSkipImmediately, "Skip the first scheduled backup immediately after creating a schedule. Default is false (don't skip).")
 }
 
 // NewInstallOptions instantiates a new, default InstallOptions struct.
-func NewInstallOptions() *InstallOptions {
-	return &InstallOptions{
+func NewInstallOptions() *Options {
+	return &Options{
 		Namespace:                 velerov1api.DefaultNamespace,
 		Image:                     velero.DefaultVeleroImage(),
 		BackupStorageConfig:       flag.NewMap(),
@@ -144,19 +153,22 @@ func NewInstallOptions() *InstallOptions {
 		NoDefaultBackupLocation:  false,
 		CRDsOnly:                 false,
 		DefaultVolumesToFsBackup: false,
-		UploaderType:             uploader.ResticType,
+		UploaderType:             uploader.KopiaType,
+		DefaultSnapshotMoveData:  false,
+		DisableInformerCache:     true,
+		ScheduleSkipImmediately:  false,
 	}
 }
 
 // AsVeleroOptions translates the values provided at the command line into values used to instantiate Kubernetes resources
-func (o *InstallOptions) AsVeleroOptions() (*install.VeleroOptions, error) {
+func (o *Options) AsVeleroOptions() (*install.VeleroOptions, error) {
 	var secretData []byte
 	if o.SecretFile != "" && !o.NoSecret {
 		realPath, err := filepath.Abs(o.SecretFile)
 		if err != nil {
 			return nil, err
 		}
-		secretData, err = ioutil.ReadFile(realPath)
+		secretData, err = os.ReadFile(realPath)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +179,7 @@ func (o *InstallOptions) AsVeleroOptions() (*install.VeleroOptions, error) {
 		if err != nil {
 			return nil, err
 		}
-		caCertData, err = ioutil.ReadFile(realPath)
+		caCertData, err = os.ReadFile(realPath)
 		if err != nil {
 			return nil, err
 		}
@@ -196,17 +208,22 @@ func (o *InstallOptions) AsVeleroOptions() (*install.VeleroOptions, error) {
 		SecretData:                      secretData,
 		RestoreOnly:                     o.RestoreOnly,
 		UseNodeAgent:                    o.UseNodeAgent,
+		PrivilegedNodeAgent:             o.PrivilegedNodeAgent,
 		UseVolumeSnapshots:              o.UseVolumeSnapshots,
 		BSLConfig:                       o.BackupStorageConfig.Data(),
 		VSLConfig:                       o.VolumeSnapshotConfig.Data(),
 		DefaultRepoMaintenanceFrequency: o.DefaultRepoMaintenanceFrequency,
 		GarbageCollectionFrequency:      o.GarbageCollectionFrequency,
+		PodVolumeOperationTimeout:       o.PodVolumeOperationTimeout,
 		Plugins:                         o.Plugins,
 		NoDefaultBackupLocation:         o.NoDefaultBackupLocation,
 		CACertData:                      caCertData,
 		Features:                        strings.Split(o.Features, ","),
 		DefaultVolumesToFsBackup:        o.DefaultVolumesToFsBackup,
 		UploaderType:                    o.UploaderType,
+		DefaultSnapshotMoveData:         o.DefaultSnapshotMoveData,
+		DisableInformerCache:            o.DisableInformerCache,
+		ScheduleSkipImmediately:         o.ScheduleSkipImmediately,
 	}, nil
 }
 
@@ -232,7 +249,7 @@ The '--namespace' flag can be used to specify a different namespace to install i
 
 Use '--wait' to wait for the Velero Deployment to be ready before proceeding.
 
-Use '-o yaml' or '-o json'  with '--dry-run' to output all generated resources as text instead of sending the resources to the server.
+Use '-o yaml' or '-o json' with '--dry-run' to output all generated resources as text instead of sending the resources to the server.
 This is useful as a starting point for more customized installations.
 		`,
 		Example: `  # velero install --provider gcp --plugins velero/velero-plugin-for-gcp:v1.0.0 --bucket mybucket --secret-file ./gcp-service-account.json
@@ -265,7 +282,7 @@ This is useful as a starting point for more customized installations.
 }
 
 // Run executes a command in the context of the provided arguments.
-func (o *InstallOptions) Run(c *cobra.Command, f client.Factory) error {
+func (o *Options) Run(c *cobra.Command, f client.Factory) error {
 	var resources *unstructured.UnstructuredList
 	if o.CRDsOnly {
 		resources = install.AllCRDs()
@@ -327,14 +344,14 @@ func (o *InstallOptions) Run(c *cobra.Command, f client.Factory) error {
 	return nil
 }
 
-//Complete completes options for a command.
-func (o *InstallOptions) Complete(args []string, f client.Factory) error {
+// Complete completes options for a command.
+func (o *Options) Complete(args []string, f client.Factory) error {
 	o.Namespace = f.Namespace()
 	return nil
 }
 
 // Validate validates options provided to a command.
-func (o *InstallOptions) Validate(c *cobra.Command, args []string, f client.Factory) error {
+func (o *Options) Validate(c *cobra.Command, args []string, f client.Factory) error {
 	if err := output.ValidateFlags(c); err != nil {
 		return err
 	}
@@ -356,7 +373,6 @@ func (o *InstallOptions) Validate(c *cobra.Command, args []string, f client.Fact
 	}
 
 	if o.NoDefaultBackupLocation {
-
 		if o.BucketName != "" {
 			return errors.New("Cannot use both --bucket and --no-default-backup-location at the same time")
 		}
@@ -376,7 +392,6 @@ func (o *InstallOptions) Validate(c *cobra.Command, args []string, f client.Fact
 		if o.BucketName == "" {
 			return errors.New("--bucket is required")
 		}
-
 	}
 
 	if o.UseVolumeSnapshots {
@@ -416,6 +431,10 @@ func (o *InstallOptions) Validate(c *cobra.Command, args []string, f client.Fact
 
 	if o.GarbageCollectionFrequency < 0 {
 		return errors.New("--garbage-collection-frequency must be non-negative")
+	}
+
+	if o.PodVolumeOperationTimeout < 0 {
+		return errors.New("--pod-volume-operation-timeout must be non-negative")
 	}
 
 	return nil

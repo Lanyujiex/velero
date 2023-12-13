@@ -21,12 +21,13 @@ import (
 	"github.com/spf13/cobra"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 
-	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
-	"github.com/vmware-tanzu/velero/pkg/features"
+	"github.com/vmware-tanzu/velero/pkg/datamover"
 
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/backup"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	velerodiscovery "github.com/vmware-tanzu/velero/pkg/discovery"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	veleroplugin "github.com/vmware-tanzu/velero/pkg/plugin/framework"
 	plugincommon "github.com/vmware-tanzu/velero/pkg/plugin/framework/common"
 	"github.com/vmware-tanzu/velero/pkg/restore"
@@ -59,7 +60,10 @@ func NewCommand(f client.Factory) *cobra.Command {
 				RegisterRestoreItemAction("velero.io/change-pvc-node-selector", newChangePVCNodeSelectorItemAction(f)).
 				RegisterRestoreItemAction("velero.io/apiservice", newAPIServiceRestoreItemAction).
 				RegisterRestoreItemAction("velero.io/admission-webhook-configuration", newAdmissionWebhookConfigurationAction).
-				RegisterRestoreItemAction("velero.io/secret", newSecretRestoreItemAction(f))
+				RegisterRestoreItemAction("velero.io/secret", newSecretRestoreItemAction(f)).
+				RegisterRestoreItemAction("velero.io/dataupload", newDataUploadRetrieveAction(f)).
+				RegisterDeleteItemAction("velero.io/dataupload-delete", newDateUploadDeleteItemAction(f))
+
 			if !features.IsEnabled(velerov1api.APIGroupVersionsFeatureFlag) {
 				// Do not register crd-remap-version BIA if the API Group feature flag is enabled, so that the v1 CRD can be backed up
 				pluginServer = pluginServer.RegisterBackupItemAction("velero.io/crd-remap-version", newRemapCRDVersionAction(f))
@@ -148,12 +152,12 @@ func newPodVolumeRestoreItemAction(f client.Factory) plugincommon.HandlerInitial
 			return nil, err
 		}
 
-		veleroClient, err := f.Client()
+		crClient, err := f.KubebuilderClient()
 		if err != nil {
 			return nil, err
 		}
 
-		return restore.NewPodVolumeRestoreAction(logger, client.CoreV1().ConfigMaps(f.Namespace()), veleroClient.VeleroV1().PodVolumeBackups(f.Namespace())), nil
+		return restore.NewPodVolumeRestoreAction(logger, client.CoreV1().ConfigMaps(f.Namespace()), crClient), nil
 	}
 }
 
@@ -243,5 +247,26 @@ func newSecretRestoreItemAction(f client.Factory) plugincommon.HandlerInitialize
 			return nil, err
 		}
 		return restore.NewSecretAction(logger, client), nil
+	}
+}
+
+func newDataUploadRetrieveAction(f client.Factory) plugincommon.HandlerInitializer {
+	return func(logger logrus.FieldLogger) (interface{}, error) {
+		client, err := f.KubebuilderClient()
+		if err != nil {
+			return nil, err
+		}
+
+		return restore.NewDataUploadRetrieveAction(logger, client), nil
+	}
+}
+
+func newDateUploadDeleteItemAction(f client.Factory) plugincommon.HandlerInitializer {
+	return func(logger logrus.FieldLogger) (interface{}, error) {
+		client, err := f.KubebuilderClient()
+		if err != nil {
+			return nil, err
+		}
+		return datamover.NewDataUploadDeleteAction(logger, client), nil
 	}
 }

@@ -19,6 +19,7 @@ package hook
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/podexec"
 	"github.com/vmware-tanzu/velero/pkg/restorehelper"
+	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
@@ -61,6 +63,7 @@ const (
 	podRestoreHookOnErrorAnnotationKey              = "post.hook.restore.velero.io/on-error"
 	podRestoreHookTimeoutAnnotationKey              = "post.hook.restore.velero.io/exec-timeout"
 	podRestoreHookWaitTimeoutAnnotationKey          = "post.hook.restore.velero.io/wait-timeout"
+	podRestoreHookWaitForReadyAnnotationKey         = "post.hook.restore.velero.io/wait-for-ready"
 	podRestoreHookInitContainerImageAnnotationKey   = "init.hook.restore.velero.io/container-image"
 	podRestoreHookInitContainerNameAnnotationKey    = "init.hook.restore.velero.io/container-name"
 	podRestoreHookInitContainerCommandAnnotationKey = "init.hook.restore.velero.io/command"
@@ -79,6 +82,7 @@ type ItemHookHandler interface {
 		obj runtime.Unstructured,
 		resourceHooks []ResourceHook,
 		phase hookPhase,
+		hookTracker *HookTracker,
 	) error
 }
 
@@ -197,6 +201,7 @@ func (h *DefaultItemHookHandler) HandleHooks(
 	obj runtime.Unstructured,
 	resourceHooks []ResourceHook,
 	phase hookPhase,
+	hookTracker *HookTracker,
 ) error {
 	// We only support hooks on pods right now
 	if groupResource != kuberesource.Pods {
@@ -218,18 +223,29 @@ func (h *DefaultItemHookHandler) HandleHooks(
 		hookFromAnnotations = getPodExecHookFromAnnotations(metadata.GetAnnotations(), "", log)
 	}
 	if hookFromAnnotations != nil {
+		hookTracker.Add(namespace, name, hookFromAnnotations.Container, HookSourceAnnotation, "", phase)
+
 		hookLog := log.WithFields(
 			logrus.Fields{
-				"hookSource": "annotation",
+				"hookSource": HookSourceAnnotation,
 				"hookType":   "exec",
 				"hookPhase":  phase,
 			},
 		)
-		if err := h.PodCommandExecutor.ExecutePodCommand(hookLog, obj.UnstructuredContent(), namespace, name, "<from-annotation>", hookFromAnnotations); err != nil {
-			hookLog.WithError(err).Error("Error executing hook")
-			if hookFromAnnotations.OnError == velerov1api.HookErrorModeFail {
-				return err
-			}
+
+		hookFailed := false
+		var errExec error
+		if errExec = h.PodCommandExecutor.ExecutePodCommand(hookLog, obj.UnstructuredContent(), namespace, name, "<from-annotation>", hookFromAnnotations); errExec != nil {
+			hookLog.WithError(errExec).Error("Error executing hook")
+			hookFailed = true
+		}
+		errTracker := hookTracker.Record(namespace, name, hookFromAnnotations.Container, HookSourceAnnotation, "", phase, hookFailed)
+		if errTracker != nil {
+			hookLog.WithError(errTracker).Warn("Error recording the hook in hook tracker")
+		}
+
+		if errExec != nil && hookFromAnnotations.OnError == velerov1api.HookErrorModeFail {
+			return errExec
 		}
 
 		return nil
@@ -237,6 +253,8 @@ func (h *DefaultItemHookHandler) HandleHooks(
 
 	labels := labels.Set(metadata.GetLabels())
 	// Otherwise, check for hooks defined in the backup spec.
+	// modeFailError records the error from the hook with "Fail" error mode
+	var modeFailError error
 	for _, resourceHook := range resourceHooks {
 		if !resourceHook.Selector.applicableTo(groupResource, namespace, labels) {
 			continue
@@ -248,21 +266,34 @@ func (h *DefaultItemHookHandler) HandleHooks(
 		} else {
 			hooks = resourceHook.Post
 		}
+
 		for _, hook := range hooks {
 			if groupResource == kuberesource.Pods {
 				if hook.Exec != nil {
-					hookLog := log.WithFields(
-						logrus.Fields{
-							"hookSource": "backupSpec",
-							"hookType":   "exec",
-							"hookPhase":  phase,
-						},
-					)
-					err := h.PodCommandExecutor.ExecutePodCommand(hookLog, obj.UnstructuredContent(), namespace, name, resourceHook.Name, hook.Exec)
-					if err != nil {
-						hookLog.WithError(err).Error("Error executing hook")
-						if hook.Exec.OnError == velerov1api.HookErrorModeFail {
-							return err
+					hookTracker.Add(namespace, name, hook.Exec.Container, HookSourceSpec, resourceHook.Name, phase)
+					// The remaining hooks will only be executed if modeFailError is nil.
+					// Otherwise, execution will stop and only hook collection will occur.
+					if modeFailError == nil {
+						hookLog := log.WithFields(
+							logrus.Fields{
+								"hookSource": HookSourceSpec,
+								"hookType":   "exec",
+								"hookPhase":  phase,
+							},
+						)
+
+						hookFailed := false
+						err := h.PodCommandExecutor.ExecutePodCommand(hookLog, obj.UnstructuredContent(), namespace, name, resourceHook.Name, hook.Exec)
+						if err != nil {
+							hookLog.WithError(err).Error("Error executing hook")
+							hookFailed = true
+							if hook.Exec.OnError == velerov1api.HookErrorModeFail {
+								modeFailError = err
+							}
+						}
+						errTracker := hookTracker.Record(namespace, name, hook.Exec.Container, HookSourceSpec, resourceHook.Name, phase, hookFailed)
+						if errTracker != nil {
+							hookLog.WithError(errTracker).Warn("Error recording the hook in hook tracker")
 						}
 					}
 				}
@@ -270,6 +301,20 @@ func (h *DefaultItemHookHandler) HandleHooks(
 		}
 	}
 
+	return modeFailError
+}
+
+// NoOpItemHookHandler is the an itemHookHandler for the Finalize controller where hooks don't run
+type NoOpItemHookHandler struct{}
+
+func (h *NoOpItemHookHandler) HandleHooks(
+	log logrus.FieldLogger,
+	groupResource schema.GroupResource,
+	obj runtime.Unstructured,
+	resourceHooks []ResourceHook,
+	phase hookPhase,
+	hookTracker *HookTracker,
+) error {
 	return nil
 }
 
@@ -464,12 +509,23 @@ func getPodExecRestoreHookFromAnnotations(annotations map[string]string, log log
 		}
 	}
 
+	waitForReadyString := annotations[podRestoreHookWaitForReadyAnnotationKey]
+	waitForReady := boolptr.False()
+	if waitForReadyString != "" {
+		var err error
+		*waitForReady, err = strconv.ParseBool(waitForReadyString)
+		if err != nil {
+			log.Warn(errors.Wrapf(err, "Unable to parse wait for ready %s, ignoring", waitForReadyString))
+		}
+	}
+
 	return &velerov1api.ExecRestoreHook{
-		Container:   container,
-		Command:     parseStringToCommand(commandValue),
-		OnError:     onError,
-		ExecTimeout: metav1.Duration{Duration: execTimeout},
-		WaitTimeout: metav1.Duration{Duration: waitTimeout},
+		Container:    container,
+		Command:      parseStringToCommand(commandValue),
+		OnError:      onError,
+		ExecTimeout:  metav1.Duration{Duration: execTimeout},
+		WaitTimeout:  metav1.Duration{Duration: waitTimeout},
+		WaitForReady: waitForReady,
 	}
 }
 
@@ -487,6 +543,7 @@ func GroupRestoreExecHooks(
 	resourceRestoreHooks []ResourceRestoreHook,
 	pod *corev1api.Pod,
 	log logrus.FieldLogger,
+	hookTrack *HookTracker,
 ) (map[string][]PodExecRestoreHook, error) {
 	byContainer := map[string][]PodExecRestoreHook{}
 
@@ -503,10 +560,11 @@ func GroupRestoreExecHooks(
 		if hookFromAnnotation.Container == "" {
 			hookFromAnnotation.Container = pod.Spec.Containers[0].Name
 		}
+		hookTrack.Add(metadata.GetNamespace(), metadata.GetName(), hookFromAnnotation.Container, HookSourceAnnotation, "<from-annotation>", hookPhase(""))
 		byContainer[hookFromAnnotation.Container] = []PodExecRestoreHook{
 			{
 				HookName:   "<from-annotation>",
-				HookSource: "annotation",
+				HookSource: HookSourceAnnotation,
 				Hook:       *hookFromAnnotation,
 			},
 		}
@@ -527,12 +585,17 @@ func GroupRestoreExecHooks(
 			named := PodExecRestoreHook{
 				HookName:   rrh.Name,
 				Hook:       *rh.Exec,
-				HookSource: "backupSpec",
+				HookSource: HookSourceSpec,
+			}
+			// default to false if attr WaitForReady not set
+			if named.Hook.WaitForReady == nil {
+				named.Hook.WaitForReady = boolptr.False()
 			}
 			// default to first container in pod if unset, without mutating resource restore hook
 			if named.Hook.Container == "" {
 				named.Hook.Container = pod.Spec.Containers[0].Name
 			}
+			hookTrack.Add(metadata.GetNamespace(), metadata.GetName(), named.Hook.Container, HookSourceSpec, rrh.Name, hookPhase(""))
 			byContainer[named.Hook.Container] = append(byContainer[named.Hook.Container], named)
 		}
 	}

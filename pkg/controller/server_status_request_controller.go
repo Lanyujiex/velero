@@ -58,8 +58,8 @@ type serverStatusRequestReconciler struct {
 
 // NewServerStatusRequestReconciler initializes and returns serverStatusRequestReconciler struct.
 func NewServerStatusRequestReconciler(
-	client client.Client,
 	ctx context.Context,
+	client client.Client,
 	pluginRegistry PluginLister,
 	clock clocks.WithTickerAndDelayedExecution,
 	log logrus.FieldLogger) *serverStatusRequestReconciler {
@@ -74,6 +74,7 @@ func NewServerStatusRequestReconciler(
 
 // +kubebuilder:rbac:groups=velero.io,resources=serverstatusrequests,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=velero.io,resources=serverstatusrequests/status,verbs=get;update;patch
+
 func (r *serverStatusRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.log.WithFields(logrus.Fields{
 		"controller":          ServerStatusRequest,

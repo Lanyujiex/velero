@@ -24,15 +24,14 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	veleroimage "github.com/vmware-tanzu/velero/internal/velero"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
-	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/plugin/framework/common"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
@@ -48,16 +47,16 @@ const (
 )
 
 type PodVolumeRestoreAction struct {
-	logger                logrus.FieldLogger
-	client                corev1client.ConfigMapInterface
-	podVolumeBackupClient velerov1client.PodVolumeBackupInterface
+	logger   logrus.FieldLogger
+	client   corev1client.ConfigMapInterface
+	crClient ctrlclient.Client
 }
 
-func NewPodVolumeRestoreAction(logger logrus.FieldLogger, client corev1client.ConfigMapInterface, podVolumeBackupClient velerov1client.PodVolumeBackupInterface) *PodVolumeRestoreAction {
+func NewPodVolumeRestoreAction(logger logrus.FieldLogger, client corev1client.ConfigMapInterface, crClient ctrlclient.Client) *PodVolumeRestoreAction {
 	return &PodVolumeRestoreAction{
-		logger:                logger,
-		client:                client,
-		podVolumeBackupClient: podVolumeBackupClient,
+		logger:   logger,
+		client:   client,
+		crClient: crClient,
 	}
 }
 
@@ -87,9 +86,11 @@ func (a *PodVolumeRestoreAction) Execute(input *velero.RestoreItemActionExecuteI
 
 	log := a.logger.WithField("pod", kube.NamespaceAndName(&pod))
 
-	opts := label.NewListOptionsForBackup(input.Restore.Spec.BackupName)
-	podVolumeBackupList, err := a.podVolumeBackupClient.List(context.TODO(), opts)
-	if err != nil {
+	opts := &ctrlclient.ListOptions{
+		LabelSelector: label.NewSelectorForBackup(input.Restore.Spec.BackupName),
+	}
+	podVolumeBackupList := new(velerov1api.PodVolumeBackupList)
+	if err := a.crClient.List(context.TODO(), podVolumeBackupList, opts); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -108,7 +109,7 @@ func (a *PodVolumeRestoreAction) Execute(input *velero.RestoreItemActionExecuteI
 	// TODO we might want/need to get plugin config at the top of this method at some point; for now, wait
 	// until we know we're doing a restore before getting config.
 	log.Debugf("Getting plugin config")
-	config, err := getPluginConfig(common.PluginKindRestoreItemAction, "velero.io/pod-volume-restore", a.client)
+	config, err := common.GetPluginConfig(common.PluginKindRestoreItemAction, "velero.io/pod-volume-restore", a.client)
 	if err != nil {
 		return nil, err
 	}
@@ -218,11 +219,10 @@ func getImage(log logrus.FieldLogger, config *corev1.ConfigMap) string {
 		// tag-less image name: add default image tag for this version of Velero
 		log.Infof("Plugin config contains image name without tag. Adding tag: %q", tag)
 		return fmt.Sprintf("%s:%s", image, tag)
-	} else {
-		// tagged image name
-		log.Debugf("Plugin config contains image name with tag")
-		return image
 	}
+	// tagged image name
+	log.Debugf("Plugin config contains image name with tag")
+	return image
 }
 
 // getResourceRequests extracts the CPU and memory requests from a ConfigMap.
@@ -258,35 +258,6 @@ func getSecurityContext(log logrus.FieldLogger, config *corev1.ConfigMap) (strin
 		config.Data["secCtxRunAsGroup"],
 		config.Data["secCtxAllowPrivilegeEscalation"],
 		config.Data["secCtx"]
-}
-
-// TODO eventually this can move to pkg/plugin/framework since it'll be used across multiple
-// plugins.
-func getPluginConfig(kind common.PluginKind, name string, client corev1client.ConfigMapInterface) (*corev1.ConfigMap, error) {
-	opts := metav1.ListOptions{
-		// velero.io/plugin-config: true
-		// velero.io/pod-volume-restore: RestoreItemAction
-		LabelSelector: fmt.Sprintf("velero.io/plugin-config,%s=%s", name, kind),
-	}
-
-	list, err := client.List(context.TODO(), opts)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	if len(list.Items) == 0 {
-		return nil, nil
-	}
-
-	if len(list.Items) > 1 {
-		var items []string
-		for _, item := range list.Items {
-			items = append(items, item.Name)
-		}
-		return nil, errors.Errorf("found more than one ConfigMap matching label selector %q: %v", opts.LabelSelector, items)
-	}
-
-	return &list.Items[0], nil
 }
 
 func newRestoreInitContainerBuilder(image, restoreUID string) *builder.ContainerBuilder {

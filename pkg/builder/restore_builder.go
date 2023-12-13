@@ -165,3 +165,15 @@ func (b *RestoreBuilder) CompletionTimestamp(val time.Time) *RestoreBuilder {
 	b.object.Status.CompletionTimestamp = &metav1.Time{Time: val}
 	return b
 }
+
+// ItemOperationTimeout sets the Restore's ItemOperationTimeout
+func (b *RestoreBuilder) ItemOperationTimeout(timeout time.Duration) *RestoreBuilder {
+	b.object.Spec.ItemOperationTimeout.Duration = timeout
+	return b
+}
+
+// WriteSparseFiles sets the Restore's uploader write sparse files
+func (b *RestoreBuilder) WriteSparseFiles(val bool) *RestoreBuilder {
+	b.object.Spec.UploaderConfig.WriteSparseFiles = &val
+	return b
+}

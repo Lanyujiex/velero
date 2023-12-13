@@ -36,7 +36,6 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
-	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 const (
@@ -45,10 +44,11 @@ const (
 
 type scheduleReconciler struct {
 	client.Client
-	namespace string
-	logger    logrus.FieldLogger
-	clock     clocks.WithTickerAndDelayedExecution
-	metrics   *metrics.ServerMetrics
+	namespace       string
+	logger          logrus.FieldLogger
+	clock           clocks.WithTickerAndDelayedExecution
+	metrics         *metrics.ServerMetrics
+	skipImmediately bool
 }
 
 func NewScheduleReconciler(
@@ -56,13 +56,15 @@ func NewScheduleReconciler(
 	logger logrus.FieldLogger,
 	client client.Client,
 	metrics *metrics.ServerMetrics,
+	skipImmediately bool,
 ) *scheduleReconciler {
 	return &scheduleReconciler{
-		Client:    client,
-		namespace: namespace,
-		logger:    logger,
-		clock:     clocks.RealClock{},
-		metrics:   metrics,
+		Client:          client,
+		namespace:       namespace,
+		logger:          logger,
+		clock:           clocks.RealClock{},
+		metrics:         metrics,
+		skipImmediately: skipImmediately,
 	}
 }
 
@@ -95,14 +97,22 @@ func (c *scheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := c.Get(ctx, req.NamespacedName, schedule); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.WithError(err).Error("schedule not found")
+			c.metrics.RemoveSchedule(req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, errors.Wrapf(err, "error getting schedule %s", req.String())
 	}
-
 	c.metrics.InitSchedule(schedule.Name)
 
 	original := schedule.DeepCopy()
+
+	if schedule.Spec.SkipImmediately == nil {
+		schedule.Spec.SkipImmediately = &c.skipImmediately
+	}
+	if schedule.Spec.SkipImmediately != nil && *schedule.Spec.SkipImmediately {
+		*schedule.Spec.SkipImmediately = false
+		schedule.Status.LastSkipped = &metav1.Time{Time: c.clock.Now()}
+	}
 
 	// validation - even if the item is Enabled, we can't trust it
 	// so re-validate
@@ -116,10 +126,25 @@ func (c *scheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		schedule.Status.Phase = velerov1.SchedulePhaseEnabled
 	}
 
-	// update status if it's changed
+	scheduleNeedsPatch := false
+	errStringArr := make([]string, 0)
 	if currentPhase != schedule.Status.Phase {
+		scheduleNeedsPatch = true
+		errStringArr = append(errStringArr, fmt.Sprintf("phase to %s", schedule.Status.Phase))
+	}
+	// update spec.SkipImmediately if it's changed
+	if original.Spec.SkipImmediately != schedule.Spec.SkipImmediately {
+		scheduleNeedsPatch = true
+		errStringArr = append(errStringArr, fmt.Sprintf("spec.skipImmediately to %v", schedule.Spec.SkipImmediately))
+	}
+	// update status if it's changed
+	if original.Status.LastSkipped != schedule.Status.LastSkipped {
+		scheduleNeedsPatch = true
+		errStringArr = append(errStringArr, fmt.Sprintf("last skipped to %v", schedule.Status.LastSkipped))
+	}
+	if scheduleNeedsPatch {
 		if err := c.Patch(ctx, schedule, client.MergeFrom(original)); err != nil {
-			return ctrl.Result{}, errors.Wrapf(err, "error updating phase of schedule %s to %s", req.String(), schedule.Status.Phase)
+			return ctrl.Result{}, errors.Wrapf(err, "error updating %v for schedule %s", errStringArr, req.String())
 		}
 	}
 
@@ -151,7 +176,7 @@ func parseCronSchedule(itm *velerov1.Schedule, logger logrus.FieldLogger) (cron.
 		return nil, validationErrors
 	}
 
-	log := logger.WithField("schedule", kubeutil.NamespaceAndName(itm))
+	log := logger.WithField("schedule", kube.NamespaceAndName(itm))
 
 	// adding a recover() around cron.Parse because it panics on empty string and is possible
 	// that it panics under other scenarios as well.
@@ -183,7 +208,7 @@ func parseCronSchedule(itm *velerov1.Schedule, logger logrus.FieldLogger) (cron.
 
 // checkIfBackupInNewOrProgress check whether there are backups created by this schedule still in New or InProgress state
 func (c *scheduleReconciler) checkIfBackupInNewOrProgress(schedule *velerov1.Schedule) bool {
-	log := c.logger.WithField("schedule", kubeutil.NamespaceAndName(schedule))
+	log := c.logger.WithField("schedule", kube.NamespaceAndName(schedule))
 	backupList := &velerov1.BackupList{}
 	options := &client.ListOptions{
 		Namespace: schedule.Namespace,
@@ -200,18 +225,17 @@ func (c *scheduleReconciler) checkIfBackupInNewOrProgress(schedule *velerov1.Sch
 
 	for _, backup := range backupList.Items {
 		if backup.Status.Phase == velerov1.BackupPhaseNew || backup.Status.Phase == velerov1.BackupPhaseInProgress {
+			log.Debugf("%s/%s still has backups that are in InProgress or New...", schedule.Namespace, schedule.Name)
 			return true
 		}
 	}
-
-	log.Debugf("Schedule %s/%s still has backups are in InProgress or New state, skip submitting backup to avoid overlap.", schedule.Namespace, schedule.Name)
 	return false
 }
 
 // ifDue check whether schedule is due to create a new backup.
 func (c *scheduleReconciler) ifDue(schedule *velerov1.Schedule, cronSchedule cron.Schedule) bool {
 	isDue, nextRunTime := getNextRunTime(schedule, cronSchedule, c.clock.Now())
-	log := c.logger.WithField("schedule", kubeutil.NamespaceAndName(schedule))
+	log := c.logger.WithField("schedule", kube.NamespaceAndName(schedule))
 
 	if !isDue {
 		log.WithField("nextRunTime", nextRunTime).Debug("Schedule is not due, skipping")
@@ -250,6 +274,9 @@ func getNextRunTime(schedule *velerov1.Schedule, cronSchedule cron.Schedule, asO
 	} else {
 		lastBackupTime = schedule.CreationTimestamp.Time
 	}
+	if schedule.Status.LastSkipped != nil && schedule.Status.LastSkipped.After(lastBackupTime) {
+		lastBackupTime = schedule.Status.LastSkipped.Time
+	}
 
 	nextRunTime := cronSchedule.Next(lastBackupTime)
 
@@ -258,10 +285,8 @@ func getNextRunTime(schedule *velerov1.Schedule, cronSchedule cron.Schedule, asO
 
 func getBackup(item *velerov1.Schedule, timestamp time.Time) *velerov1.Backup {
 	name := item.TimestampedName(timestamp)
-	backup := builder.
+	return builder.
 		ForBackup(item.Namespace, name).
 		FromSchedule(item).
 		Result()
-
-	return backup
 }

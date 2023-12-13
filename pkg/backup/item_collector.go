@@ -20,7 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"sort"
 	"strings"
 
@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/pager"
@@ -37,6 +36,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
 )
 
@@ -58,11 +58,33 @@ type kubernetesResource struct {
 	namespace, name, path string
 }
 
+// getItemsFromResourceIdentifiers converts ResourceIdentifiers to
+// kubernetesResources
+func (r *itemCollector) getItemsFromResourceIdentifiers(resourceIDs []velero.ResourceIdentifier) []*kubernetesResource {
+	grResourceIDsMap := make(map[schema.GroupResource][]velero.ResourceIdentifier)
+	for _, resourceID := range resourceIDs {
+		grResourceIDsMap[resourceID.GroupResource] = append(grResourceIDsMap[resourceID.GroupResource], resourceID)
+	}
+	return r.getItems(grResourceIDsMap)
+}
+
 // getAllItems gets all relevant items from all API groups.
 func (r *itemCollector) getAllItems() []*kubernetesResource {
+	return r.getItems(nil)
+}
+
+// getItems gets all relevant items from all API groups.
+// If resourceIDsMap is nil, then all items from the cluster are
+// pulled for each API group, subject to include/exclude rules.
+// If resourceIDsMap is supplied, then only those resources are
+// returned, with the appropriate APIGroup information filled in. In
+// this case, include/exclude rules are not invoked, since we already
+// have the list of items, we just need the item collector/discovery
+// helper to fill in the missing GVR, etc. context.
+func (r *itemCollector) getItems(resourceIDsMap map[schema.GroupResource][]velero.ResourceIdentifier) []*kubernetesResource {
 	var resources []*kubernetesResource
 	for _, group := range r.discoveryHelper.Resources() {
-		groupItems, err := r.getGroupItems(r.log, group)
+		groupItems, err := r.getGroupItems(r.log, group, resourceIDsMap)
 		if err != nil {
 			r.log.WithError(err).WithField("apiGroup", group.String()).Error("Error collecting resources from API group")
 			continue
@@ -75,7 +97,9 @@ func (r *itemCollector) getAllItems() []*kubernetesResource {
 }
 
 // getGroupItems collects all relevant items from a single API group.
-func (r *itemCollector) getGroupItems(log logrus.FieldLogger, group *metav1.APIResourceList) ([]*kubernetesResource, error) {
+// If resourceIDsMap is supplied, then only those items are returned,
+// with GVR/APIResource metadata supplied.
+func (r *itemCollector) getGroupItems(log logrus.FieldLogger, group *metav1.APIResourceList, resourceIDsMap map[schema.GroupResource][]velero.ResourceIdentifier) ([]*kubernetesResource, error) {
 	log = log.WithField("group", group.GroupVersion)
 
 	log.Infof("Getting items for group")
@@ -93,7 +117,7 @@ func (r *itemCollector) getGroupItems(log logrus.FieldLogger, group *metav1.APIR
 
 	var items []*kubernetesResource
 	for _, resource := range group.APIResources {
-		resourceItems, err := r.getResourceItems(log, gv, resource)
+		resourceItems, err := r.getResourceItems(log, gv, resource, resourceIDsMap)
 		if err != nil {
 			log.WithError(err).WithField("resource", resource.String()).Error("Error getting items for resource")
 			continue
@@ -164,15 +188,16 @@ func getOrderedResourcesForType(orderedResources map[string]string, resourceType
 }
 
 // getResourceItems collects all relevant items for a given group-version-resource.
-func (r *itemCollector) getResourceItems(log logrus.FieldLogger, gv schema.GroupVersion, resource metav1.APIResource) ([]*kubernetesResource, error) {
+// If resourceIDsMap is supplied, the items will be pulled from here
+// rather than from the cluster and applying include/exclude rules.
+func (r *itemCollector) getResourceItems(log logrus.FieldLogger, gv schema.GroupVersion, resource metav1.APIResource, resourceIDsMap map[schema.GroupResource][]velero.ResourceIdentifier) ([]*kubernetesResource, error) {
 	log = log.WithField("resource", resource.Name)
 
 	log.Info("Getting items for resource")
 
 	var (
-		gvr           = gv.WithResource(resource.Name)
-		gr            = gvr.GroupResource()
-		clusterScoped = !resource.Namespaced
+		gvr = gv.WithResource(resource.Name)
+		gr  = gvr.GroupResource()
 	)
 
 	orders := getOrderedResourcesForType(r.backupRequest.Backup.Spec.OrderedResources, resource.Name)
@@ -182,25 +207,48 @@ func (r *itemCollector) getResourceItems(log logrus.FieldLogger, gv schema.Group
 		return nil, errors.WithStack(err)
 	}
 
-	// If the resource we are backing up is NOT namespaces, and it is cluster-scoped, check to see if
-	// we should include it based on the IncludeClusterResources setting.
-	if gr != kuberesource.Namespaces && clusterScoped {
-		if r.backupRequest.Spec.IncludeClusterResources == nil {
-			if !r.backupRequest.NamespaceIncludesExcludes.IncludeEverything() {
-				// when IncludeClusterResources == nil (auto), only directly
-				// back up cluster-scoped resources if we're doing a full-cluster
-				// (all namespaces) backup. Note that in the case of a subset of
-				// namespaces being backed up, some related cluster-scoped resources
-				// may still be backed up if triggered by a custom action (e.g. PVC->PV).
-				// If we're processing namespaces themselves, we will not skip here, they may be
-				// filtered out later.
-				log.Info("Skipping resource because it's cluster-scoped and only specific namespaces are included in the backup")
-				return nil, nil
-			}
-		} else if !*r.backupRequest.Spec.IncludeClusterResources {
-			log.Info("Skipping resource because it's cluster-scoped")
+	// If we have a resourceIDs map, then only return items listed in it
+	if resourceIDsMap != nil {
+		resourceIDs, ok := resourceIDsMap[gr]
+		if !ok {
+			log.Info("Skipping resource because no items found in supplied ResourceIdentifier list")
 			return nil, nil
 		}
+		var items []*kubernetesResource
+		for _, resourceID := range resourceIDs {
+			log.WithFields(
+				logrus.Fields{
+					"namespace": resourceID.Namespace,
+					"name":      resourceID.Name,
+				},
+			).Infof("Getting item")
+			resourceClient, err := r.dynamicFactory.ClientForGroupVersionResource(gv, resource, resourceID.Namespace)
+			if err != nil {
+				log.WithError(errors.WithStack(err)).Error("Error getting client for resource")
+				continue
+			}
+			unstructured, err := resourceClient.Get(resourceID.Name, metav1.GetOptions{})
+			if err != nil {
+				log.WithError(errors.WithStack(err)).Error("Error getting item")
+				continue
+			}
+
+			path, err := r.writeToFile(unstructured)
+			if err != nil {
+				log.WithError(err).Error("Error writing item to file")
+				continue
+			}
+
+			items = append(items, &kubernetesResource{
+				groupResource: gr,
+				preferredGVR:  preferredGVR,
+				namespace:     resourceID.Namespace,
+				name:          resourceID.Name,
+				path:          path,
+			})
+		}
+
+		return items, nil
 	}
 
 	if !r.backupRequest.ResourceIncludesExcludes.ShouldInclude(gr.String()) {
@@ -223,59 +271,28 @@ func (r *itemCollector) getResourceItems(log logrus.FieldLogger, gv schema.Group
 		}
 	}
 
-	namespacesToList := getNamespacesToList(r.backupRequest.NamespaceIncludesExcludes)
-
-	// Check if we're backing up namespaces for a less-than-full backup.
-	// We enter this block if resource is Namespaces and the namespae list is either empty or contains
-	// an explicit namespace list. (We skip this block if the list contains "" since that indicates
-	// a full-cluster backup
-	if gr == kuberesource.Namespaces && (len(namespacesToList) == 0 || namespacesToList[0] != "") {
+	// Handle namespace resource here.
+	// Namespace are only filtered by namespace include/exclude filters.
+	// Label selectors are not checked.
+	if gr == kuberesource.Namespaces {
 		resourceClient, err := r.dynamicFactory.ClientForGroupVersionResource(gv, resource, "")
 		if err != nil {
 			log.WithError(err).Error("Error getting dynamic client")
-		} else {
-			var labelSelector labels.Selector
-			if r.backupRequest.Spec.LabelSelector != nil {
-				labelSelector, err = metav1.LabelSelectorAsSelector(r.backupRequest.Spec.LabelSelector)
-				if err != nil {
-					// This should never happen...
-					return nil, errors.Wrap(err, "invalid label selector")
-				}
-			}
-
-			var items []*kubernetesResource
-			for _, ns := range namespacesToList {
-				log = log.WithField("namespace", ns)
-				log.Info("Getting namespace")
-				unstructured, err := resourceClient.Get(ns, metav1.GetOptions{})
-				if err != nil {
-					log.WithError(errors.WithStack(err)).Error("Error getting namespace")
-					continue
-				}
-
-				labels := labels.Set(unstructured.GetLabels())
-				if labelSelector != nil && !labelSelector.Matches(labels) {
-					log.Info("Skipping namespace because it does not match the backup's label selector")
-					continue
-				}
-
-				path, err := r.writeToFile(unstructured)
-				if err != nil {
-					log.WithError(err).Error("Error writing item to file")
-					continue
-				}
-
-				items = append(items, &kubernetesResource{
-					groupResource: gr,
-					preferredGVR:  preferredGVR,
-					name:          ns,
-					path:          path,
-				})
-			}
-
-			return items, nil
+			return nil, errors.WithStack(err)
 		}
+		unstructuredList, err := resourceClient.List(metav1.ListOptions{})
+		if err != nil {
+			log.WithError(errors.WithStack(err)).Error("error list namespaces")
+			return nil, errors.WithStack(err)
+		}
+
+		items := r.backupNamespaces(unstructuredList, r.backupRequest.NamespaceIncludesExcludes, gr, preferredGVR, log)
+
+		return items, nil
 	}
+
+	clusterScoped := !resource.Namespaced
+	namespacesToList := getNamespacesToList(r.backupRequest.NamespaceIncludesExcludes)
 
 	// If we get here, we're backing up something other than namespaces
 	if clusterScoped {
@@ -340,11 +357,6 @@ func (r *itemCollector) getResourceItems(log logrus.FieldLogger, gv schema.Group
 		for i := range unstructuredItems {
 			item := &unstructuredItems[i]
 
-			if gr == kuberesource.Namespaces && !r.backupRequest.NamespaceIncludesExcludes.ShouldInclude(item.GetName()) {
-				log.WithField("name", item.GetName()).Info("Skipping namespace because it's excluded")
-				continue
-			}
-
 			path, err := r.writeToFile(item)
 			if err != nil {
 				log.WithError(err).Error("Error writing item to file")
@@ -368,7 +380,7 @@ func (r *itemCollector) getResourceItems(log logrus.FieldLogger, gv schema.Group
 }
 
 func (r *itemCollector) writeToFile(item *unstructured.Unstructured) (string, error) {
-	f, err := ioutil.TempFile(r.dir, "")
+	f, err := os.CreateTemp(r.dir, "")
 	if err != nil {
 		return "", errors.Wrap(err, "error creating temp file")
 	}
@@ -517,4 +529,31 @@ func (r *itemCollector) listItemsForLabel(unstructuredItems []unstructured.Unstr
 		unstructuredItems = append(unstructuredItems, unstructuredList.Items...)
 	}
 	return unstructuredItems, nil
+}
+
+// backupNamespaces process namespace resource according to namespace filters.
+func (r *itemCollector) backupNamespaces(unstructuredList *unstructured.UnstructuredList,
+	ie *collections.IncludesExcludes, gr schema.GroupResource, preferredGVR schema.GroupVersionResource,
+	log logrus.FieldLogger) []*kubernetesResource {
+	var items []*kubernetesResource
+	for index, unstructured := range unstructuredList.Items {
+		if ie.ShouldInclude(unstructured.GetName()) {
+			log.Debugf("Backup namespace %s due to namespace filters setting.", unstructured.GetName())
+
+			path, err := r.writeToFile(&unstructuredList.Items[index])
+			if err != nil {
+				log.WithError(err).Error("Error writing item to file")
+				continue
+			}
+
+			items = append(items, &kubernetesResource{
+				groupResource: gr,
+				preferredGVR:  preferredGVR,
+				name:          unstructured.GetName(),
+				path:          path,
+			})
+		}
+	}
+
+	return items
 }

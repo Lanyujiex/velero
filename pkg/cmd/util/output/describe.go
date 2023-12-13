@@ -47,15 +47,6 @@ func Describe(fn func(d *Describer)) string {
 	return d.buf.String()
 }
 
-func NewDescriber(minwidth, tabwidth, padding int, padchar byte, flags uint) *Describer {
-	d := &Describer{
-		out: new(tabwriter.Writer),
-		buf: new(bytes.Buffer),
-	}
-	d.out.Init(d.buf, minwidth, tabwidth, padding, padchar, flags)
-	return d
-}
-
 func (d *Describer) Printf(msg string, args ...interface{}) {
 	fmt.Fprint(d.out, d.Prefix)
 	fmt.Fprintf(d.out, msg, args...)
@@ -149,7 +140,7 @@ func NewStructuredDescriber(format string) *StructuredDescriber {
 func DescribeInSF(fn func(d *StructuredDescriber), format string) string {
 	d := NewStructuredDescriber(format)
 	fn(d)
-	return d.JsonEncode()
+	return d.JSONEncode()
 }
 
 // Describe adds all types of argument to d.output.
@@ -167,12 +158,17 @@ func (d *StructuredDescriber) DescribeMetadata(metadata metav1.ObjectMeta) {
 	d.Describe("metadata", metadataInfo)
 }
 
-// JsonEncode encodes d.output to json
-func (d *StructuredDescriber) JsonEncode() string {
+// JSONEncode encodes d.output to json
+func (d *StructuredDescriber) JSONEncode() string {
 	byteBuffer := &bytes.Buffer{}
 	encoder := json.NewEncoder(byteBuffer)
 	encoder.SetEscapeHTML(false)
 	encoder.SetIndent("", "    ")
-	_ = encoder.Encode(d.output)
+
+	err := encoder.Encode(d.output)
+	if err != nil {
+		fmt.Printf("fail to encode %s", err.Error())
+		return ""
+	}
 	return byteBuffer.String()
 }

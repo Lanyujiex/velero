@@ -48,8 +48,8 @@ func (v *VolumeSnapshotContentBuilder) Result() *snapshotv1api.VolumeSnapshotCon
 }
 
 // Status initiates VolumeSnapshotContent's status.
-func (v *VolumeSnapshotContentBuilder) Status() *VolumeSnapshotContentBuilder {
-	v.object.Status = &snapshotv1api.VolumeSnapshotContentStatus{}
+func (v *VolumeSnapshotContentBuilder) Status(status *snapshotv1api.VolumeSnapshotContentStatus) *VolumeSnapshotContentBuilder {
+	v.object.Status = status
 	return v
 }
 
@@ -59,6 +59,7 @@ func (v *VolumeSnapshotContentBuilder) DeletionPolicy(policy snapshotv1api.Delet
 	return v
 }
 
+// VolumeSnapshotRef sets the built VolumeSnapshotContent's spec.VolumeSnapshotRef value.
 func (v *VolumeSnapshotContentBuilder) VolumeSnapshotRef(namespace, name string) *VolumeSnapshotContentBuilder {
 	v.object.Spec.VolumeSnapshotRef = v1.ObjectReference{
 		APIVersion: "snapshot.storage.k8s.io/v1",
@@ -66,5 +67,20 @@ func (v *VolumeSnapshotContentBuilder) VolumeSnapshotRef(namespace, name string)
 		Namespace:  namespace,
 		Name:       name,
 	}
+	return v
+}
+
+// VolumeSnapshotClassName sets the built VolumeSnapshotContent's spec.VolumeSnapshotClassName value.
+func (v *VolumeSnapshotContentBuilder) VolumeSnapshotClassName(name string) *VolumeSnapshotContentBuilder {
+	v.object.Spec.VolumeSnapshotClassName = &name
+	return v
+}
+
+// ObjectMeta applies functional options to the VolumeSnapshotContent's ObjectMeta.
+func (v *VolumeSnapshotContentBuilder) ObjectMeta(opts ...ObjectMetaOpt) *VolumeSnapshotContentBuilder {
+	for _, opt := range opts {
+		opt(v.object)
+	}
+
 	return v
 }

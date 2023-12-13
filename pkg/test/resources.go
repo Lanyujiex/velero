@@ -142,6 +142,17 @@ func ServiceAccounts(items ...metav1.Object) *APIResource {
 	}
 }
 
+func ConfigMaps(items ...metav1.Object) *APIResource {
+	return &APIResource{
+		Group:      "",
+		Version:    "v1",
+		Name:       "configmaps",
+		ShortName:  "cm",
+		Namespaced: true,
+		Items:      items,
+	}
+}
+
 func CRDs(items ...metav1.Object) *APIResource {
 	return &APIResource{
 		Group:      "apiextensions.k8s.io",
@@ -163,12 +174,32 @@ func VSLs(items ...metav1.Object) *APIResource {
 	}
 }
 
+func Backups(items ...metav1.Object) *APIResource {
+	return &APIResource{
+		Group:      "velero.io",
+		Version:    "v1",
+		Name:       "backups",
+		Namespaced: true,
+		Items:      items,
+	}
+}
+
 func Services(items ...metav1.Object) *APIResource {
 	return &APIResource{
 		Group:      "",
 		Version:    "v1",
 		Name:       "services",
 		ShortName:  "svc",
+		Namespaced: true,
+		Items:      items,
+	}
+}
+
+func DataUploads(items ...metav1.Object) *APIResource {
+	return &APIResource{
+		Group:      "velero.io",
+		Version:    "v2alpha1",
+		Name:       "datauploads",
 		Namespaced: true,
 		Items:      items,
 	}

@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -26,11 +26,11 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 
-	. "github.com/vmware-tanzu/velero/test/e2e"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/k8s"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/kibishii"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/providers"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/velero"
+	. "github.com/vmware-tanzu/velero/test"
+	. "github.com/vmware-tanzu/velero/test/util/k8s"
+	. "github.com/vmware-tanzu/velero/test/util/kibishii"
+	. "github.com/vmware-tanzu/velero/test/util/providers"
+	. "github.com/vmware-tanzu/velero/test/util/velero"
 )
 
 const deletionTest = "deletion-workload"
@@ -47,7 +47,6 @@ func BackupDeletionWithRestic() {
 func backup_deletion_test(useVolumeSnapshots bool) {
 	var (
 		backupName string
-		err        error
 		veleroCfg  VeleroConfig
 	)
 	veleroCfg = VeleroCfg
@@ -60,22 +59,18 @@ func backup_deletion_test(useVolumeSnapshots bool) {
 		}
 		var err error
 		flag.Parse()
+		if veleroCfg.InstallVelero {
+			Expect(PrepareVelero(context.Background(), "backup deletion")).To(Succeed())
+		}
 		UUIDgen, err = uuid.NewRandom()
 		Expect(err).To(Succeed())
-		if veleroCfg.InstallVelero {
-			Expect(VeleroInstall(context.Background(), &veleroCfg)).To(Succeed())
-		}
 	})
 
 	AfterEach(func() {
 		if !veleroCfg.Debug {
 			By("Clean backups after test", func() {
-				DeleteBackups(context.Background(), *veleroCfg.ClientToInstallVelero)
+				DeleteAllBackups(context.Background(), *veleroCfg.ClientToInstallVelero)
 			})
-			if veleroCfg.InstallVelero {
-				err = VeleroUninstall(context.Background(), veleroCfg.VeleroCLI, veleroCfg.VeleroNamespace)
-				Expect(err).To(Succeed())
-			}
 		}
 	})
 
@@ -91,7 +86,8 @@ func backup_deletion_test(useVolumeSnapshots bool) {
 // runUpgradeTests runs upgrade test on the provider by kibishii.
 func runBackupDeletionTests(client TestClient, veleroCfg VeleroConfig, backupName, backupLocation string,
 	useVolumeSnapshots bool, kibishiiDirectory string) error {
-	oneHourTimeout, _ := context.WithTimeout(context.Background(), time.Minute*60)
+	oneHourTimeout, ctxCancel := context.WithTimeout(context.Background(), time.Minute*60)
+	defer ctxCancel()
 	veleroCLI := veleroCfg.VeleroCLI
 	providerName := veleroCfg.CloudProvider
 	veleroNamespace := veleroCfg.VeleroNamespace
@@ -136,7 +132,7 @@ func runBackupDeletionTests(client TestClient, veleroCfg VeleroConfig, backupNam
 	})
 
 	if providerName == "vsphere" && useVolumeSnapshots {
-		// Wait for uploads started by the Velero Plug-in for vSphere to complete
+		// Wait for uploads started by the Velero Plugin for vSphere to complete
 		// TODO - remove after upload progress monitoring is implemented
 		fmt.Println("Waiting for vSphere uploads to complete")
 		if err := WaitForVSphereUploadCompletion(oneHourTimeout, time.Hour, deletionTest, 2); err != nil {
@@ -149,7 +145,7 @@ func runBackupDeletionTests(client TestClient, veleroCfg VeleroConfig, backupNam
 	}
 	var snapshotCheckPoint SnapshotCheckPoint
 	if useVolumeSnapshots {
-		snapshotCheckPoint, err = GetSnapshotCheckPoint(client, veleroCfg, 2, deletionTest, backupName, KibishiiPodNameList)
+		snapshotCheckPoint, err = GetSnapshotCheckPoint(client, veleroCfg, 2, deletionTest, backupName, KibishiiPVCNameList)
 		Expect(err).NotTo(HaveOccurred(), "Fail to get Azure CSI snapshot checkpoint")
 		err = SnapshotsShouldBeCreatedInCloud(veleroCfg.CloudProvider,
 			veleroCfg.CloudCredentialsFile, veleroCfg.BSLBucket, bslConfig,

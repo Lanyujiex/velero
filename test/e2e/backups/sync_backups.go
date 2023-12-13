@@ -16,7 +16,7 @@
  * /
  */
 
-//Refer to https://github.com/vmware-tanzu/velero/issues/4253
+// Refer to https://github.com/vmware-tanzu/velero/issues/4253
 package backups
 
 import (
@@ -30,16 +30,15 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	. "github.com/vmware-tanzu/velero/test/e2e"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/k8s"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/providers"
-	. "github.com/vmware-tanzu/velero/test/e2e/util/velero"
+	. "github.com/vmware-tanzu/velero/test"
+	. "github.com/vmware-tanzu/velero/test/util/k8s"
+	. "github.com/vmware-tanzu/velero/test/util/providers"
+	. "github.com/vmware-tanzu/velero/test/util/velero"
 )
 
 type SyncBackups struct {
 	testNS     string
 	backupName string
-	ctx        context.Context
 }
 
 func (b *SyncBackups) Init() {
@@ -47,7 +46,6 @@ func (b *SyncBackups) Init() {
 	UUIDgen, _ = uuid.NewRandom()
 	b.testNS = "sync-bsl-test-" + UUIDgen.String()
 	b.backupName = "sync-bsl-test-" + UUIDgen.String()
-	b.ctx, _ = context.WithTimeout(context.Background(), time.Minute*10)
 }
 
 func BackupsSyncTest() {
@@ -61,17 +59,19 @@ func BackupsSyncTest() {
 		if VeleroCfg.InstallVelero {
 			veleroCfg := VeleroCfg
 			veleroCfg.UseVolumeSnapshots = false
-			Expect(VeleroInstall(context.Background(), &VeleroCfg)).To(Succeed())
+			Expect(VeleroInstall(context.Background(), &VeleroCfg, false)).To(Succeed())
 		}
 	})
 
 	AfterEach(func() {
 		if !VeleroCfg.Debug {
 			By("Clean backups after test", func() {
-				DeleteBackups(context.Background(), *VeleroCfg.ClientToInstallVelero)
+				DeleteAllBackups(context.Background(), *VeleroCfg.ClientToInstallVelero)
 			})
 			if VeleroCfg.InstallVelero {
-				Expect(VeleroUninstall(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To(Succeed())
+				ctx, ctxCancel := context.WithTimeout(context.Background(), time.Minute*5)
+				defer ctxCancel()
+				Expect(VeleroUninstall(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To(Succeed())
 			}
 		}
 
@@ -79,12 +79,14 @@ func BackupsSyncTest() {
 
 	It("Backups in object storage should be synced to a new Velero successfully", func() {
 		test.Init()
+		ctx, ctxCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer ctxCancel()
 		By(fmt.Sprintf("Prepare workload as target to backup by creating namespace %s namespace", test.testNS))
-		Expect(CreateNamespace(test.ctx, *VeleroCfg.ClientToInstallVelero, test.testNS)).To(Succeed(),
+		Expect(CreateNamespace(ctx, *VeleroCfg.ClientToInstallVelero, test.testNS)).To(Succeed(),
 			fmt.Sprintf("Failed to create %s namespace", test.testNS))
 		if !VeleroCfg.Debug {
 			defer func() {
-				Expect(DeleteNamespace(test.ctx, *VeleroCfg.ClientToInstallVelero, test.testNS, false)).To(Succeed(), fmt.Sprintf("Failed to delete the namespace %s", test.testNS))
+				Expect(DeleteNamespace(ctx, *VeleroCfg.ClientToInstallVelero, test.testNS, false)).To(Succeed(), fmt.Sprintf("Failed to delete the namespace %s", test.testNS))
 			}()
 		}
 
@@ -95,7 +97,7 @@ func BackupsSyncTest() {
 		BackupCfg.UseVolumeSnapshots = false
 		BackupCfg.Selector = ""
 		By(fmt.Sprintf("Backup the workload in %s namespace", test.testNS), func() {
-			Expect(VeleroBackupNamespace(test.ctx, VeleroCfg.VeleroCLI,
+			Expect(VeleroBackupNamespace(ctx, VeleroCfg.VeleroCLI,
 				VeleroCfg.VeleroNamespace, BackupCfg)).To(Succeed(), func() string {
 				RunDebug(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, test.backupName, "")
 				return "Fail to backup workload"
@@ -103,29 +105,31 @@ func BackupsSyncTest() {
 		})
 
 		By("Uninstall velero", func() {
-			Expect(VeleroUninstall(test.ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To(Succeed())
+			Expect(VeleroUninstall(ctx, VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace)).To(Succeed())
 		})
 
 		By("Install velero", func() {
 			veleroCfg := VeleroCfg
 			veleroCfg.UseVolumeSnapshots = false
-			Expect(VeleroInstall(test.ctx, &VeleroCfg)).To(Succeed())
+			Expect(VeleroInstall(ctx, &VeleroCfg, false)).To(Succeed())
 		})
 
 		By("Check all backups in object storage are synced to Velero", func() {
-			Expect(test.IsBackupsSynced()).To(Succeed(), fmt.Sprintf("Failed to sync backup %s from object storage", test.backupName))
+			Expect(test.IsBackupsSynced(ctx, ctxCancel)).To(Succeed(), fmt.Sprintf("Failed to sync backup %s from object storage", test.backupName))
 		})
 	})
 
 	It("Deleted backups in object storage are synced to be deleted in Velero", func() {
 		test.Init()
+		ctx, ctxCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer ctxCancel()
 		By(fmt.Sprintf("Prepare workload as target to backup by creating namespace in %s namespace", test.testNS), func() {
-			Expect(CreateNamespace(test.ctx, *VeleroCfg.ClientToInstallVelero, test.testNS)).To(Succeed(),
+			Expect(CreateNamespace(ctx, *VeleroCfg.ClientToInstallVelero, test.testNS)).To(Succeed(),
 				fmt.Sprintf("Failed to create %s namespace", test.testNS))
 		})
 		if !VeleroCfg.Debug {
 			defer func() {
-				Expect(DeleteNamespace(test.ctx, *VeleroCfg.ClientToInstallVelero, test.testNS, false)).To(Succeed(),
+				Expect(DeleteNamespace(ctx, *VeleroCfg.ClientToInstallVelero, test.testNS, false)).To(Succeed(),
 					fmt.Sprintf("Failed to delete the namespace %s", test.testNS))
 			}()
 		}
@@ -136,7 +140,7 @@ func BackupsSyncTest() {
 		BackupCfg.UseVolumeSnapshots = false
 		BackupCfg.Selector = ""
 		By(fmt.Sprintf("Backup the workload in %s namespace", test.testNS), func() {
-			Expect(VeleroBackupNamespace(test.ctx, VeleroCfg.VeleroCLI,
+			Expect(VeleroBackupNamespace(ctx, VeleroCfg.VeleroCLI,
 				VeleroCfg.VeleroNamespace, BackupCfg)).To(Succeed(), func() string {
 				RunDebug(context.Background(), VeleroCfg.VeleroCLI, VeleroCfg.VeleroNamespace, test.backupName, "")
 				return "Fail to backup workload"
@@ -156,11 +160,12 @@ func BackupsSyncTest() {
 		})
 
 		By("Check if backups are deleted as a result of sync from BSL", func() {
-			Expect(WaitBackupDeleted(test.ctx, VeleroCfg.VeleroCLI, test.backupName, time.Minute*10)).To(Succeed(), fmt.Sprintf("Failed to check backup %s deleted", test.backupName))
+			Expect(WaitBackupDeleted(ctx, VeleroCfg.VeleroCLI, test.backupName, time.Minute*10)).To(Succeed(), fmt.Sprintf("Failed to check backup %s deleted", test.backupName))
 		})
 	})
 }
 
-func (b *SyncBackups) IsBackupsSynced() error {
-	return WaitForBackupToBeCreated(b.ctx, VeleroCfg.VeleroCLI, b.backupName, 10*time.Minute)
+func (b *SyncBackups) IsBackupsSynced(ctx context.Context, ctxCancel context.CancelFunc) error {
+	defer ctxCancel()
+	return WaitForBackupToBeCreated(ctx, VeleroCfg.VeleroCLI, b.backupName, 10*time.Minute)
 }

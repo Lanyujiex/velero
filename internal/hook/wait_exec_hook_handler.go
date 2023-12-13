@@ -29,6 +29,7 @@ import (
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/podexec"
+	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
@@ -38,6 +39,7 @@ type WaitExecHookHandler interface {
 		log logrus.FieldLogger,
 		pod *v1.Pod,
 		byContainer map[string][]PodExecRestoreHook,
+		hookTrack *HookTracker,
 	) []error
 }
 
@@ -47,6 +49,11 @@ type ListWatchFactory interface {
 
 type DefaultListWatchFactory struct {
 	PodsGetter cache.Getter
+}
+
+type HookErrInfo struct {
+	Namespace string
+	Err       error
 }
 
 func (d *DefaultListWatchFactory) NewListWatch(namespace string, selector fields.Selector) cache.ListerWatcher {
@@ -67,6 +74,7 @@ func (e *DefaultWaitExecHookHandler) HandleHooks(
 	log logrus.FieldLogger,
 	pod *v1.Pod,
 	byContainer map[string][]PodExecRestoreHook,
+	hookTracker *HookTracker,
 ) []error {
 	if pod == nil {
 		return nil
@@ -126,8 +134,8 @@ func (e *DefaultWaitExecHookHandler) HandleHooks(
 		}
 
 		for containerName, hooks := range byContainer {
-			if !isContainerRunning(newPod, containerName) {
-				podLog.Infof("Container %s is not running: post-restore hooks will not yet be executed", containerName)
+			if !isContainerUp(newPod, containerName, hooks) {
+				podLog.Infof("Container %s is not up: post-restore hooks will not yet be executed", containerName)
 				continue
 			}
 			podMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(newPod)
@@ -157,8 +165,14 @@ func (e *DefaultWaitExecHookHandler) HandleHooks(
 				if hook.Hook.WaitTimeout.Duration != 0 && time.Since(waitStart) > hook.Hook.WaitTimeout.Duration {
 					err := fmt.Errorf("hook %s in container %s expired before executing", hook.HookName, hook.Hook.Container)
 					hookLog.Error(err)
+					errors = append(errors, err)
+
+					errTracker := hookTracker.Record(newPod.Namespace, newPod.Name, hook.Hook.Container, hook.HookSource, hook.HookName, hookPhase(""), true)
+					if errTracker != nil {
+						hookLog.WithError(errTracker).Warn("Error recording the hook in hook tracker")
+					}
+
 					if hook.Hook.OnError == velerov1api.HookErrorModeFail {
-						errors = append(errors, err)
 						cancel()
 						return
 					}
@@ -169,13 +183,24 @@ func (e *DefaultWaitExecHookHandler) HandleHooks(
 					OnError:   hook.Hook.OnError,
 					Timeout:   hook.Hook.ExecTimeout,
 				}
-				if err := e.PodCommandExecutor.ExecutePodCommand(hookLog, podMap, pod.Namespace, pod.Name, hook.HookName, eh); err != nil {
-					hookLog.WithError(err).Error("Error executing hook")
-					if hook.Hook.OnError == velerov1api.HookErrorModeFail {
-						errors = append(errors, err)
-						cancel()
-						return
-					}
+
+				hookFailed := false
+				var hookErr error
+				if hookErr = e.PodCommandExecutor.ExecutePodCommand(hookLog, podMap, pod.Namespace, pod.Name, hook.HookName, eh); hookErr != nil {
+					hookLog.WithError(hookErr).Error("Error executing hook")
+					hookErr = fmt.Errorf("hook %s in container %s failed to execute, err: %v", hook.HookName, hook.Hook.Container, hookErr)
+					errors = append(errors, hookErr)
+					hookFailed = true
+				}
+
+				errTracker := hookTracker.Record(newPod.Namespace, newPod.Name, hook.Hook.Container, hook.HookSource, hook.HookName, hookPhase(""), hookFailed)
+				if errTracker != nil {
+					hookLog.WithError(errTracker).Warn("Error recording the hook in hook tracker")
+				}
+
+				if hookErr != nil && hook.Hook.OnError == velerov1api.HookErrorModeFail {
+					cancel()
+					return
 				}
 			}
 			delete(byContainer, containerName)
@@ -203,10 +228,9 @@ func (e *DefaultWaitExecHookHandler) HandleHooks(
 	podWatcher.Run(ctx.Done())
 
 	// There are some cases where this function could return with unexecuted hooks: the pod may
-	// be deleted, a hook with OnError mode Fail could fail, or it may timeout waiting for
+	// be deleted, a hook could fail, or it may timeout waiting for
 	// containers to become ready.
-	// Each unexecuted hook is logged as an error but only hooks with OnError mode Fail return
-	// an error from this function.
+	// Each unexecuted hook is logged as an error and this error will be returned from this function.
 	for _, hooks := range byContainer {
 		for _, hook := range hooks {
 			if hook.executed {
@@ -220,10 +244,14 @@ func (e *DefaultWaitExecHookHandler) HandleHooks(
 					"hookPhase":  "post",
 				},
 			)
-			hookLog.Error(err)
-			if hook.Hook.OnError == velerov1api.HookErrorModeFail {
-				errors = append(errors, err)
+
+			errTracker := hookTracker.Record(pod.Namespace, pod.Name, hook.Hook.Container, hook.HookSource, hook.HookName, hookPhase(""), true)
+			if errTracker != nil {
+				hookLog.WithError(errTracker).Warn("Error recording the hook in hook tracker")
 			}
+
+			hookLog.Error(err)
+			errors = append(errors, err)
 		}
 	}
 
@@ -243,13 +271,23 @@ func podHasContainer(pod *v1.Pod, containerName string) bool {
 	return false
 }
 
-func isContainerRunning(pod *v1.Pod, containerName string) bool {
+func isContainerUp(pod *v1.Pod, containerName string, hooks []PodExecRestoreHook) bool {
 	if pod == nil {
 		return false
+	}
+	var waitForReady bool
+	for _, hook := range hooks {
+		if boolptr.IsSetToTrue(hook.Hook.WaitForReady) {
+			waitForReady = true
+			break
+		}
 	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.Name != containerName {
 			continue
+		}
+		if waitForReady {
+			return cs.Ready
 		}
 		return cs.State.Running != nil
 	}

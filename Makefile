@@ -22,9 +22,11 @@ PKG := github.com/vmware-tanzu/velero
 
 # Where to push the docker image.
 REGISTRY ?= velero
+GCR_REGISTRY ?= gcr.io/velero-gcp
 
 # Image name
 IMAGE ?= $(REGISTRY)/$(BIN)
+GCR_IMAGE ?= $(GCR_REGISTRY)/$(BIN)
 
 # We allow the Dockerfile to be configurable to enable the use of custom Dockerfiles
 # that pull base images from different registries.
@@ -66,8 +68,10 @@ TAG_LATEST ?= false
 
 ifeq ($(TAG_LATEST), true)
 	IMAGE_TAGS ?= $(IMAGE):$(VERSION) $(IMAGE):latest
+	GCR_IMAGE_TAGS ?= $(GCR_IMAGE):$(VERSION) $(GCR_IMAGE):latest
 else
 	IMAGE_TAGS ?= $(IMAGE):$(VERSION)
+	GCR_IMAGE_TAGS ?= $(GCR_IMAGE):$(VERSION)
 endif
 
 ifeq ($(shell docker buildx inspect 2>/dev/null | awk '/Status/ { print $$2 }'), running)
@@ -95,9 +99,6 @@ ifneq ($(shell git status --porcelain 2> /dev/null),)
 else
 	GIT_TREE_STATE ?= clean
 endif
-
-# The default linters used by lint and local-lint
-LINTERS ?= "gosec,goconst,gofmt,goimports,unparam"
 
 ###
 ### These variables should not need tweaking.
@@ -186,6 +187,7 @@ endif
 	--output=type=$(BUILDX_OUTPUT_TYPE) \
 	--platform $(BUILDX_PLATFORMS) \
 	$(addprefix -t , $(IMAGE_TAGS)) \
+	$(addprefix -t , $(GCR_IMAGE_TAGS)) \
 	--build-arg=GOPROXY=$(GOPROXY) \
 	--build-arg=PKG=$(PKG) \
 	--build-arg=BIN=$(BIN) \
@@ -221,26 +223,20 @@ endif
 
 lint:
 ifneq ($(SKIP_TESTS), 1)
-	@$(MAKE) shell CMD="-c 'hack/lint.sh $(LINTERS)'"
+	@$(MAKE) shell CMD="-c 'hack/lint.sh'"
 endif
 
 local-lint:
 ifneq ($(SKIP_TESTS), 1)
-	@hack/lint.sh $(LINTERS)
-endif
-
-lint-all:
-ifneq ($(SKIP_TESTS), 1)
-	@$(MAKE) shell CMD="-c 'hack/lint.sh $(LINTERS) true'"
-endif
-
-local-lint-all:
-ifneq ($(SKIP_TESTS), 1)
-	@hack/lint.sh $(LINTERS) true
+	@hack/lint.sh
 endif
 
 update:
 	@$(MAKE) shell CMD="-c 'hack/update-all.sh'"
+
+# update-crd is for development purpose only, it is faster than update, so is a shortcut when you want to generate CRD changes only
+update-crd:
+	@$(MAKE) shell CMD="-c 'hack/update-3generated-crd-code.sh'"	
 
 build-dirs:
 	@mkdir -p _output/bin/$(GOOS)/$(GOARCH)
@@ -353,7 +349,7 @@ serve-docs: build-image-hugo
 	-v "$$(pwd)/site:/srv/hugo" \
 	-it -p 1313:1313 \
 	$(HUGO_IMAGE) \
-	hugo server --bind=0.0.0.0 --enableGitInfo=false
+	server --bind=0.0.0.0 --enableGitInfo=false
 # gen-docs generates a new versioned docs directory under site/content/docs.
 # Please read the documentation in the script for instructions on how to use it.
 gen-docs:
@@ -362,3 +358,10 @@ gen-docs:
 .PHONY: test-e2e
 test-e2e: local
 	$(MAKE) -e VERSION=$(VERSION) -C test/e2e run
+
+.PHONY: test-perf
+test-perf: local
+	$(MAKE) -e VERSION=$(VERSION) -C test/perf run
+
+go-generate:
+	go generate ./pkg/...

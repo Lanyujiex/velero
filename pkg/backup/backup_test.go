@@ -24,9 +24,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,17 +41,19 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
+	"github.com/vmware-tanzu/velero/pkg/features"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	biav2 "github.com/vmware-tanzu/velero/pkg/plugin/velero/backupitemaction/v2"
 	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/test"
-	testutil "github.com/vmware-tanzu/velero/pkg/test"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/volume"
 )
@@ -66,7 +68,11 @@ func TestBackedUpItemsMatchesTarballContents(t *testing.T) {
 	}
 
 	h := newHarness(t)
-	req := &Request{Backup: defaultBackup().Result()}
+	req := &Request{
+		Backup:           defaultBackup().Result(),
+		SkippedPVTracker: NewSkipPVTracker(),
+	}
+
 	backupFile := bytes.NewBuffer([]byte{})
 
 	apiResources := []*test.APIResource{
@@ -79,8 +85,8 @@ func TestBackedUpItemsMatchesTarballContents(t *testing.T) {
 			builder.ForDeployment("zoo", "raz").Result(),
 		),
 		test.PVs(
-			builder.ForPersistentVolume("bar").Result(),
-			builder.ForPersistentVolume("baz").Result(),
+			builder.ForPersistentVolume("bar").ClaimRef("foo", "pvc1").Result(),
+			builder.ForPersistentVolume("baz").ClaimRef("bar", "pvc2").Result(),
 		),
 	}
 	for _, resource := range apiResources {
@@ -106,7 +112,6 @@ func TestBackedUpItemsMatchesTarballContents(t *testing.T) {
 		if item.namespace != "" {
 			fileWithVersion = fileWithVersion + "/v1-preferredversion/" + "namespaces/" + item.namespace
 		} else {
-			file = file + "/cluster"
 			fileWithVersion = fileWithVersion + "/v1-preferredversion" + "/cluster"
 		}
 		fileWithVersion = fileWithVersion + "/" + item.name + ".json"
@@ -122,7 +127,10 @@ func TestBackedUpItemsMatchesTarballContents(t *testing.T) {
 // the request's BackedUpItems field.
 func TestBackupProgressIsUpdated(t *testing.T) {
 	h := newHarness(t)
-	req := &Request{Backup: defaultBackup().Result()}
+	req := &Request{
+		Backup:           defaultBackup().Result(),
+		SkippedPVTracker: NewSkipPVTracker(),
+	}
 	backupFile := bytes.NewBuffer([]byte{})
 
 	apiResources := []*test.APIResource{
@@ -156,12 +164,13 @@ func TestBackupProgressIsUpdated(t *testing.T) {
 // verifies that the set of items written to the backup tarball are
 // correct. Validation is done by looking at the names of the files in
 // the backup tarball; the contents of the files are not checked.
-func TestBackupResourceFiltering(t *testing.T) {
+func TestBackupOldResourceFiltering(t *testing.T) {
 	tests := []struct {
 		name         string
 		backup       *velerov1.Backup
 		apiResources []*test.APIResource
 		want         []string
+		actions      []biav2.BackupItemAction
 	}{
 		{
 			name:   "no filters backs up everything",
@@ -759,13 +768,105 @@ func TestBackupResourceFiltering(t *testing.T) {
 				"resources/pods/v1-preferredversion/namespaces/ns-1/pod-1.json",
 			},
 		},
+		{
+			name:   "new filters' default value should not impact the old filters' function",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludeClusterResources(true).Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Volumes(builder.ForVolume("foo").PersistentVolumeClaimSource("test-1").Result()).Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+			},
+			want: []string{
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/cluster/test2.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test2.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+			actions: []biav2.BackupItemAction{
+				&pluggableAction{
+					selector: velero.ResourceSelector{IncludedResources: []string{"persistentvolumeclaims"}},
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+						additionalItems := []velero.ResourceIdentifier{
+							{GroupResource: kuberesource.PersistentVolumes, Name: "test1"},
+						}
+
+						return item, additionalItems, "", nil, nil
+					},
+				},
+			},
+		},
+		{
+			name:   "Resource's CRD should be included",
+			backup: defaultBackup().IncludedNamespaces("foo").Result(),
+			apiResources: []*test.APIResource{
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("volumesnapshotlocations.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("test.velero.io").Result(),
+				),
+				test.VSLs(
+					builder.ForVolumeSnapshotLocation("foo", "bar").Result(),
+				),
+				test.Backups(
+					builder.ForBackup("zoo", "raz").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/volumesnapshotlocations.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/volumesnapshotlocations.velero.io.json",
+				"resources/volumesnapshotlocations.velero.io/namespaces/foo/bar.json",
+				"resources/volumesnapshotlocations.velero.io/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
+		{
+			name:   "Resource's CRD is not included, when CRD is excluded.",
+			backup: defaultBackup().IncludedNamespaces("foo").ExcludedResources("customresourcedefinitions.apiextensions.k8s.io").Result(),
+			apiResources: []*test.APIResource{
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("volumesnapshotlocations.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("test.velero.io").Result(),
+				),
+				test.VSLs(
+					builder.ForVolumeSnapshotLocation("foo", "bar").Result(),
+				),
+				test.Backups(
+					builder.ForBackup("zoo", "raz").Result(),
+				),
+			},
+			want: []string{
+				"resources/volumesnapshotlocations.velero.io/namespaces/foo/bar.json",
+				"resources/volumesnapshotlocations.velero.io/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -773,7 +874,7 @@ func TestBackupResourceFiltering(t *testing.T) {
 				h.addItems(t, resource)
 			}
 
-			h.backupper.Backup(h.log, req, backupFile, nil, nil)
+			h.backupper.Backup(h.log, req, backupFile, tc.actions, nil)
 
 			assertTarballContents(t, backupFile, append(tc.want, "metadata/version")...)
 		})
@@ -886,7 +987,7 @@ func TestCRDInclusion(t *testing.T) {
 			},
 		},
 		{
-			name: "include cluster resources=false excludes all CRDs when backing up selected namespaces",
+			name: "include-cluster-resources=false excludes all CRDs when backing up selected namespaces",
 			backup: defaultBackup().
 				IncludeClusterResources(false).
 				IncludedNamespaces("foo").
@@ -898,12 +999,12 @@ func TestCRDInclusion(t *testing.T) {
 					builder.ForCustomResourceDefinitionV1Beta1("test.velero.io").Result(),
 				),
 				test.VSLs(
-					builder.ForVolumeSnapshotLocation("foo", "vsl-1").Result(),
+					builder.ForVolumeSnapshotLocation("foo", "bar").Result(),
 				),
 			},
 			want: []string{
-				"resources/volumesnapshotlocations.velero.io/namespaces/foo/vsl-1.json",
-				"resources/volumesnapshotlocations.velero.io/v1-preferredversion/namespaces/foo/vsl-1.json",
+				"resources/volumesnapshotlocations.velero.io/namespaces/foo/bar.json",
+				"resources/volumesnapshotlocations.velero.io/v1-preferredversion/namespaces/foo/bar.json",
 			},
 		},
 		{
@@ -938,8 +1039,11 @@ func TestCRDInclusion(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -1002,7 +1106,7 @@ func TestBackupResourceCohabitation(t *testing.T) {
 			},
 		},
 		{
-			name:   "when deployments exist that are not in the cohabitating groups those are backed up along with apps/deployments",
+			name:   "when deployments exist that are not in the cohabiting groups those are backed up along with apps/deployments",
 			backup: defaultBackup().Result(),
 			apiResources: []*test.APIResource{
 				test.VeleroDeployments(
@@ -1030,8 +1134,11 @@ func TestBackupResourceCohabitation(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -1047,7 +1154,7 @@ func TestBackupResourceCohabitation(t *testing.T) {
 }
 
 // TestBackupUsesNewCohabitatingResourcesForEachBackup ensures that when two backups are
-// run that each include cohabitating resources, one copy of the relevant resources is
+// run that each include cohabiting resources, one copy of the relevant resources is
 // backed up in each backup. Verification is done by looking at the contents of the backup
 // tarball. This covers a specific issue that was fixed by https://github.com/vmware-tanzu/velero/pull/485.
 func TestBackupUsesNewCohabitatingResourcesForEachBackup(t *testing.T) {
@@ -1055,7 +1162,8 @@ func TestBackupUsesNewCohabitatingResourcesForEachBackup(t *testing.T) {
 
 	// run and verify backup 1
 	backup1 := &Request{
-		Backup: defaultBackup().Result(),
+		Backup:           defaultBackup().Result(),
+		SkippedPVTracker: NewSkipPVTracker(),
 	}
 	backup1File := bytes.NewBuffer([]byte{})
 
@@ -1068,7 +1176,8 @@ func TestBackupUsesNewCohabitatingResourcesForEachBackup(t *testing.T) {
 
 	// run and verify backup 2
 	backup2 := &Request{
-		Backup: defaultBackup().Result(),
+		Backup:           defaultBackup().Result(),
+		SkippedPVTracker: NewSkipPVTracker(),
 	}
 	backup2File := bytes.NewBuffer([]byte{})
 
@@ -1115,8 +1224,11 @@ func TestBackupResourceOrdering(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -1135,22 +1247,31 @@ func TestBackupResourceOrdering(t *testing.T) {
 // to run for specific resources/namespaces and simply records the items
 // that it is executed for.
 type recordResourcesAction struct {
-	selector        velero.ResourceSelector
-	ids             []string
-	backups         []velerov1.Backup
-	additionalItems []velero.ResourceIdentifier
-	operationID     string
+	name               string
+	selector           velero.ResourceSelector
+	ids                []string
+	backups            []velerov1.Backup
+	executionErr       error
+	additionalItems    []velero.ResourceIdentifier
+	operationID        string
+	postOperationItems []velero.ResourceIdentifier
+	skippedCSISnapshot bool
 }
 
-func (a *recordResourcesAction) Execute(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+func (a *recordResourcesAction) Execute(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 	metadata, err := meta.Accessor(item)
 	if err != nil {
-		return item, a.additionalItems, a.operationID, err
+		return item, a.additionalItems, a.operationID, a.postOperationItems, err
 	}
 	a.ids = append(a.ids, kubeutil.NamespaceAndName(metadata))
 	a.backups = append(a.backups, *backup)
-
-	return item, a.additionalItems, a.operationID, nil
+	if a.skippedCSISnapshot {
+		u := &unstructured.Unstructured{Object: item.UnstructuredContent()}
+		u.SetAnnotations(map[string]string{skippedNoCSIPVAnnotation: "true"})
+		item = u
+		a.additionalItems = nil
+	}
+	return item, a.additionalItems, a.operationID, a.postOperationItems, a.executionErr
 }
 
 func (a *recordResourcesAction) AppliesTo() (velero.ResourceSelector, error) {
@@ -1163,6 +1284,10 @@ func (a *recordResourcesAction) Progress(operationID string, backup *velerov1.Ba
 
 func (a *recordResourcesAction) Cancel(operationID string, backup *velerov1.Backup) error {
 	return nil
+}
+
+func (a *recordResourcesAction) Name() string {
+	return a.name
 }
 
 func (a *recordResourcesAction) ForResource(resource string) *recordResourcesAction {
@@ -1183,6 +1308,120 @@ func (a *recordResourcesAction) ForLabelSelector(selector string) *recordResourc
 func (a *recordResourcesAction) WithAdditionalItems(items []velero.ResourceIdentifier) *recordResourcesAction {
 	a.additionalItems = items
 	return a
+}
+
+func (a *recordResourcesAction) WithName(name string) *recordResourcesAction {
+	a.name = name
+	return a
+}
+
+func (a *recordResourcesAction) WithExecutionErr(executionErr error) *recordResourcesAction {
+	a.executionErr = executionErr
+	return a
+}
+
+func (a *recordResourcesAction) WithSkippedCSISnapshotFlag(flag bool) *recordResourcesAction {
+	a.skippedCSISnapshot = flag
+	return a
+}
+
+// TestBackupItemActionsForSkippedPV runs backups with backup item actions, and
+// verifies that the data in SkippedPVTracker is updated as expected.
+func TestBackupItemActionsForSkippedPV(t *testing.T) {
+	tests := []struct {
+		name         string
+		backupReq    *Request
+		apiResources []*test.APIResource
+		actions      []*recordResourcesAction
+		// {pvName:{approach: reason}}
+		expectSkippedPVs    map[string]map[string]string
+		expectNotSkippedPVs []string
+	}{
+		{
+			name: "backup item action returns the 'not a CSI volume' error and the PV should be tracked as skippedPV",
+			backupReq: &Request{
+				Backup:           defaultBackup().Result(),
+				SkippedPVTracker: NewSkipPVTracker(),
+			},
+			apiResources: []*test.APIResource{
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("ns-1", "pvc-1").VolumeName("pv-1").Result(),
+				),
+			},
+			actions: []*recordResourcesAction{
+				new(recordResourcesAction).WithName(csiBIAPluginName).ForNamespace("ns-1").ForResource("persistentvolumeclaims").WithSkippedCSISnapshotFlag(true),
+			},
+			expectSkippedPVs: map[string]map[string]string{
+				"pv-1": {
+					csiSnapshotApproach: "skipped b/c it's not a CSI volume",
+				},
+			},
+		},
+		{
+			name: "backup item action named as CSI plugin executed successfully and the PV will be removed from the skipped PV tracker",
+			backupReq: &Request{
+				Backup: defaultBackup().Result(),
+				SkippedPVTracker: &skipPVTracker{
+					RWMutex: &sync.RWMutex{},
+					pvs: map[string]map[string]string{
+						"pv-1": {
+							"any": "whatever reason",
+						},
+					},
+					includedPVs: map[string]struct{}{},
+				},
+			},
+			apiResources: []*test.APIResource{
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("ns-1", "pvc-1").VolumeName("pv-1").Result(),
+				),
+			},
+			actions: []*recordResourcesAction{
+				new(recordResourcesAction).ForNamespace("ns-1").ForResource("persistentvolumeclaims").WithName(csiBIAPluginName),
+			},
+			expectNotSkippedPVs: []string{"pv-1"},
+		},
+	}
+	// Enable CSI feature before running the test, because Velero will check whether
+	// CSI feature is enabled before executing CSI plugin actions.
+	features.NewFeatureFlagSet("EnableCSI")
+	defer func() {
+		features.NewFeatureFlagSet("")
+	}()
+	for _, tc := range tests {
+		t.Run(tc.name, func(tt *testing.T) {
+			var (
+				h          = newHarness(t)
+				backupFile = bytes.NewBuffer([]byte{})
+			)
+
+			for _, resource := range tc.apiResources {
+				h.addItems(t, resource)
+			}
+
+			actions := []biav2.BackupItemAction{}
+			for _, action := range tc.actions {
+				actions = append(actions, action)
+			}
+
+			err := h.backupper.Backup(h.log, tc.backupReq, backupFile, actions, nil)
+			assert.NoError(t, err)
+
+			if tc.expectSkippedPVs != nil {
+				for pvName, reasons := range tc.expectSkippedPVs {
+					v, ok := tc.backupReq.SkippedPVTracker.pvs[pvName]
+					assert.True(tt, ok)
+					for approach, reason := range reasons {
+						assert.Equal(tt, reason, v[approach])
+					}
+				}
+			}
+			for _, pvName := range tc.expectNotSkippedPVs {
+				_, ok := tc.backupReq.SkippedPVTracker.pvs[pvName]
+				assert.False(tt, ok)
+			}
+		})
+	}
 }
 
 // TestBackupActionsRunsForCorrectItems runs backups with backup item actions, and
@@ -1362,8 +1601,11 @@ func TestBackupActionsRunForCorrectItems(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -1440,8 +1682,11 @@ func TestBackupWithInvalidActions(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -1462,7 +1707,7 @@ func (a *appliesToErrorAction) AppliesTo() (velero.ResourceSelector, error) {
 	return velero.ResourceSelector{}, errors.New("error calling AppliesTo")
 }
 
-func (a *appliesToErrorAction) Execute(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+func (a *appliesToErrorAction) Execute(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 	panic("not implemented")
 }
 
@@ -1474,6 +1719,10 @@ func (a *appliesToErrorAction) Cancel(operationID string, backup *velerov1.Backu
 	panic("not implemented")
 }
 
+func (a *appliesToErrorAction) Name() string {
+	return ""
+}
+
 // TestBackupActionModifications runs backups with backup item actions that make modifications
 // to items in their Execute(...) methods and verifies that these modifications are
 // persisted to the backup tarball. Verification is done by inspecting the file contents
@@ -1483,16 +1732,16 @@ func TestBackupActionModifications(t *testing.T) {
 	// method modifies the item being passed in by calling the 'modify' function on it.
 	modifyingActionGetter := func(modify func(*unstructured.Unstructured)) *pluggableAction {
 		return &pluggableAction{
-			executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+			executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 				obj, ok := item.(*unstructured.Unstructured)
 				if !ok {
-					return nil, nil, "", errors.Errorf("unexpected type %T", item)
+					return nil, nil, "", nil, errors.Errorf("unexpected type %T", item)
 				}
 
 				res := obj.DeepCopy()
 				modify(res)
 
-				return res, nil, "", nil
+				return res, nil, "", nil, nil
 			},
 		}
 	}
@@ -1579,8 +1828,11 @@ func TestBackupActionModifications(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -1621,13 +1873,13 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 			actions: []biav2.BackupItemAction{
 				&pluggableAction{
 					selector: velero.ResourceSelector{IncludedNamespaces: []string{"ns-1"}},
-					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
 							{GroupResource: kuberesource.Pods, Namespace: "ns-2", Name: "pod-2"},
 							{GroupResource: kuberesource.Pods, Namespace: "ns-3", Name: "pod-3"},
 						}
 
-						return item, additionalItems, "", nil
+						return item, additionalItems, "", nil, nil
 					},
 				},
 			},
@@ -1652,13 +1904,13 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 			},
 			actions: []biav2.BackupItemAction{
 				&pluggableAction{
-					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
 							{GroupResource: kuberesource.Pods, Namespace: "ns-2", Name: "pod-2"},
 							{GroupResource: kuberesource.Pods, Namespace: "ns-3", Name: "pod-3"},
 						}
 
-						return item, additionalItems, "", nil
+						return item, additionalItems, "", nil, nil
 					},
 				},
 			},
@@ -1682,13 +1934,13 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 			},
 			actions: []biav2.BackupItemAction{
 				&pluggableAction{
-					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"},
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-2"},
 						}
 
-						return item, additionalItems, "", nil
+						return item, additionalItems, "", nil, nil
 					},
 				},
 			},
@@ -1715,13 +1967,13 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 			},
 			actions: []biav2.BackupItemAction{
 				&pluggableAction{
-					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"},
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-2"},
 						}
 
-						return item, additionalItems, "", nil
+						return item, additionalItems, "", nil, nil
 					},
 				},
 			},
@@ -1745,13 +1997,13 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 			},
 			actions: []biav2.BackupItemAction{
 				&pluggableAction{
-					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"},
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-2"},
 						}
 
-						return item, additionalItems, "", nil
+						return item, additionalItems, "", nil, nil
 					},
 				},
 			},
@@ -1776,13 +2028,13 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 			},
 			actions: []biav2.BackupItemAction{
 				&pluggableAction{
-					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"},
 							{GroupResource: kuberesource.PersistentVolumes, Name: "pv-2"},
 						}
 
-						return item, additionalItems, "", nil
+						return item, additionalItems, "", nil, nil
 					},
 				},
 			},
@@ -1807,13 +2059,13 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 			actions: []biav2.BackupItemAction{
 				&pluggableAction{
 					selector: velero.ResourceSelector{IncludedNamespaces: []string{"ns-1"}},
-					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 						additionalItems := []velero.ResourceIdentifier{
 							{GroupResource: kuberesource.Pods, Namespace: "ns-4", Name: "pod-4"},
 							{GroupResource: kuberesource.Pods, Namespace: "ns-5", Name: "pod-5"},
 						}
 
-						return item, additionalItems, "", nil
+						return item, additionalItems, "", nil, nil
 					},
 				},
 			},
@@ -1831,8 +2083,11 @@ func TestBackupActionAdditionalItems(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -1979,6 +2234,7 @@ func (*fakeVolumeSnapshotter) DeleteSnapshot(snapshotID string) error {
 // looking at the backup request's VolumeSnapshots field. This test uses the fakeVolumeSnapshotter
 // struct in place of real volume snapshotters.
 func TestBackupWithSnapshots(t *testing.T) {
+	// TODO: add more verification for skippedPVTracker
 	tests := []struct {
 		name              string
 		req               *Request
@@ -1994,6 +2250,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2027,6 +2284,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2061,6 +2319,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2095,6 +2354,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2129,6 +2389,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2161,6 +2422,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2175,7 +2437,8 @@ func TestBackupWithSnapshots(t *testing.T) {
 		{
 			name: "backup with no volume snapshot locations does not create any snapshots",
 			req: &Request{
-				Backup: defaultBackup().Result(),
+				Backup:           defaultBackup().Result(),
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2194,6 +2457,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2210,6 +2474,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 				SnapshotLocations: []*velerov1.VolumeSnapshotLocation{
 					newSnapshotLocation("velero", "default", "default"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2229,6 +2494,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					newSnapshotLocation("velero", "default", "default"),
 					newSnapshotLocation("velero", "another", "another"),
 				},
+				SkippedPVTracker: NewSkipPVTracker(),
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
@@ -2292,6 +2558,170 @@ func TestBackupWithSnapshots(t *testing.T) {
 	}
 }
 
+// TestBackupWithAsyncOperations runs backups which return operationIDs and
+// verifies that the itemoperations are tracked as appropriate. Verification is done by
+// looking at the backup request's itemOperationsList field.
+func TestBackupWithAsyncOperations(t *testing.T) {
+	// completedOperationAction is a *pluggableAction, whose Execute(...)
+	// method returns an operationID which will always be done when calling Progress.
+	completedOperationAction := &pluggableAction{
+		executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+			obj, ok := item.(*unstructured.Unstructured)
+			if !ok {
+				return nil, nil, "", nil, errors.Errorf("unexpected type %T", item)
+			}
+
+			return obj, nil, obj.GetName() + "-1", nil, nil
+		},
+		progressFunc: func(operationID string, backup *velerov1.Backup) (velero.OperationProgress, error) {
+			return velero.OperationProgress{
+				Completed:   true,
+				Description: "Done!",
+			}, nil
+		},
+	}
+
+	// incompleteOperationAction is a *pluggableAction, whose Execute(...)
+	// method returns an operationID which will never be done when calling Progress.
+	incompleteOperationAction := &pluggableAction{
+		executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+			obj, ok := item.(*unstructured.Unstructured)
+			if !ok {
+				return nil, nil, "", nil, errors.Errorf("unexpected type %T", item)
+			}
+
+			return obj, nil, obj.GetName() + "-1", nil, nil
+		},
+		progressFunc: func(operationID string, backup *velerov1.Backup) (velero.OperationProgress, error) {
+			return velero.OperationProgress{
+				Completed:   false,
+				Description: "Working...",
+			}, nil
+		},
+	}
+
+	// noOperationAction is a *pluggableAction, whose Execute(...)
+	// method does not return an operationID.
+	noOperationAction := &pluggableAction{
+		executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+			obj, ok := item.(*unstructured.Unstructured)
+			if !ok {
+				return nil, nil, "", nil, errors.Errorf("unexpected type %T", item)
+			}
+
+			return obj, nil, "", nil, nil
+		},
+	}
+
+	tests := []struct {
+		name         string
+		req          *Request
+		apiResources []*test.APIResource
+		actions      []biav2.BackupItemAction
+		want         []*itemoperation.BackupOperation
+	}{
+		{
+			name: "action that starts a short-running process records operation",
+			req: &Request{
+				Backup:           defaultBackup().Result(),
+				SkippedPVTracker: NewSkipPVTracker(),
+			},
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("ns-1", "pod-1").Result(),
+				),
+			},
+			actions: []biav2.BackupItemAction{
+				completedOperationAction,
+			},
+			want: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						BackupName: "backup-1",
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: kuberesource.Pods,
+							Namespace:     "ns-1",
+							Name:          "pod-1"},
+						OperationID: "pod-1-1",
+					},
+					Status: itemoperation.OperationStatus{
+						Phase: "New",
+					},
+				},
+			},
+		},
+		{
+			name: "action that starts a long-running process records operation",
+			req: &Request{
+				Backup:           defaultBackup().Result(),
+				SkippedPVTracker: NewSkipPVTracker(),
+			},
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("ns-1", "pod-2").Result(),
+				),
+			},
+			actions: []biav2.BackupItemAction{
+				incompleteOperationAction,
+			},
+			want: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						BackupName: "backup-1",
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: kuberesource.Pods,
+							Namespace:     "ns-1",
+							Name:          "pod-2"},
+						OperationID: "pod-2-1",
+					},
+					Status: itemoperation.OperationStatus{
+						Phase: "New",
+					},
+				},
+			},
+		},
+		{
+			name: "action that has no operation doesn't record one",
+			req: &Request{
+				Backup:           defaultBackup().Result(),
+				SkippedPVTracker: NewSkipPVTracker(),
+			},
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("ns-1", "pod-3").Result(),
+				),
+			},
+			actions: []biav2.BackupItemAction{
+				noOperationAction,
+			},
+			want: []*itemoperation.BackupOperation{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				h          = newHarness(t)
+				backupFile = bytes.NewBuffer([]byte{})
+			)
+
+			for _, resource := range tc.apiResources {
+				h.addItems(t, resource)
+			}
+
+			err := h.backupper.Backup(h.log, tc.req, backupFile, tc.actions, nil)
+			assert.NoError(t, err)
+
+			resultOper := *tc.req.GetItemOperationsList()
+			// set want Created times so it won't fail the assert.Equal test
+			for i, wantOper := range tc.want {
+				wantOper.Status.Created = resultOper[i].Status.Created
+			}
+			assert.Equal(t, tc.want, *tc.req.GetItemOperationsList())
+		})
+	}
+}
+
 // TestBackupWithInvalidHooks runs backups with invalid hook specifications and verifies
 // that an error is returned.
 func TestBackupWithInvalidHooks(t *testing.T) {
@@ -2333,8 +2763,11 @@ func TestBackupWithInvalidHooks(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -2581,10 +3014,13 @@ func TestBackupWithHooks(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h                  = newHarness(t)
-				req                = &Request{Backup: tc.backup}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
 				backupFile         = bytes.NewBuffer([]byte{})
-				podCommandExecutor = new(testutil.MockPodCommandExecutor)
+				podCommandExecutor = new(test.MockPodCommandExecutor)
 			)
 
 			h.backupper.podCommandExecutor = podCommandExecutor
@@ -2622,12 +3058,13 @@ type fakePodVolumeBackupper struct{}
 
 // BackupPodVolumes returns one pod volume backup per entry in volumes, with namespace "velero"
 // and name "pvb-<pod-namespace>-<pod-name>-<volume-name>".
-func (b *fakePodVolumeBackupper) BackupPodVolumes(backup *velerov1.Backup, pod *corev1.Pod, volumes []string, _ logrus.FieldLogger) ([]*velerov1.PodVolumeBackup, []error) {
+func (b *fakePodVolumeBackupper) BackupPodVolumes(backup *velerov1.Backup, pod *corev1.Pod, volumes []string, _ *resourcepolicies.Policies, _ logrus.FieldLogger) ([]*velerov1.PodVolumeBackup, *podvolume.PVCBackupSummary, []error) {
 	var res []*velerov1.PodVolumeBackup
+	pvcSummary := podvolume.NewPVCBackupSummary()
 
 	anno := pod.GetAnnotations()
 	if anno != nil && anno["backup.velero.io/bakupper-skip"] != "" {
-		return res, nil
+		return res, pvcSummary, nil
 	}
 
 	for _, vol := range volumes {
@@ -2635,7 +3072,7 @@ func (b *fakePodVolumeBackupper) BackupPodVolumes(backup *velerov1.Backup, pod *
 		res = append(res, pvb)
 	}
 
-	return res, nil
+	return res, pvcSummary, nil
 }
 
 // TestBackupWithPodVolume runs backups of pods that are annotated for PodVolume backup,
@@ -2746,8 +3183,12 @@ func TestBackupWithPodVolume(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				h          = newHarness(t)
-				req        = &Request{Backup: tc.backup, SnapshotLocations: []*velerov1.VolumeSnapshotLocation{tc.vsl}}
+				h   = newHarness(t)
+				req = &Request{
+					Backup:            tc.backup,
+					SnapshotLocations: []*velerov1.VolumeSnapshotLocation{tc.vsl},
+					SkippedPVTracker:  NewSkipPVTracker(),
+				}
 				backupFile = bytes.NewBuffer([]byte{})
 			)
 
@@ -2767,16 +3208,17 @@ func TestBackupWithPodVolume(t *testing.T) {
 	}
 }
 
-// pluggableAction is a backup item action that can be plugged with an Execute
-// function body at runtime.
+// pluggableAction is a backup item action that can be plugged with Execute
+// and Progress function bodies at runtime.
 type pluggableAction struct {
-	selector    velero.ResourceSelector
-	executeFunc func(runtime.Unstructured, *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error)
+	selector     velero.ResourceSelector
+	executeFunc  func(runtime.Unstructured, *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error)
+	progressFunc func(string, *velerov1.Backup) (velero.OperationProgress, error)
 }
 
-func (a *pluggableAction) Execute(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, error) {
+func (a *pluggableAction) Execute(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
 	if a.executeFunc == nil {
-		return item, nil, "", nil
+		return item, nil, "", nil, nil
 	}
 
 	return a.executeFunc(item, backup)
@@ -2787,11 +3229,19 @@ func (a *pluggableAction) AppliesTo() (velero.ResourceSelector, error) {
 }
 
 func (a *pluggableAction) Progress(operationID string, backup *velerov1.Backup) (velero.OperationProgress, error) {
-	return velero.OperationProgress{}, nil
+	if a.progressFunc == nil {
+		return velero.OperationProgress{}, nil
+	}
+
+	return a.progressFunc(operationID, backup)
 }
 
 func (a *pluggableAction) Cancel(operationID string, backup *velerov1.Backup) error {
 	return nil
+}
+
+func (a *pluggableAction) Name() string {
+	return ""
 }
 
 type harness struct {
@@ -2833,7 +3283,7 @@ func newHarness(t *testing.T) *harness {
 	return &harness{
 		APIServer: apiServer,
 		backupper: &kubernetesBackupper{
-			backupClient:    apiServer.VeleroClient.VeleroV1(),
+			kbClient:        test.NewFakeControllerRuntimeClient(t),
 			dynamicFactory:  client.NewDynamicFactory(apiServer.DynamicClient),
 			discoveryHelper: discoveryHelper,
 
@@ -2920,7 +3370,7 @@ func assertTarballFileContents(t *testing.T, backupFile io.Reader, want map[stri
 		}
 		require.NoError(t, err)
 
-		bytes, err := ioutil.ReadAll(r)
+		bytes, err := io.ReadAll(r)
 		require.NoError(t, err)
 
 		items[hdr.Name] = bytes
@@ -2997,5 +3447,989 @@ func assertTarballOrdering(t *testing.T, backupFile io.Reader, orderedResources 
 		// the last resource we saw for the backed-up order to be correct.
 		assert.True(t, current >= lastSeen, "%s was backed up out of order", resourceName)
 		lastSeen = current
+	}
+}
+
+func TestBackupNewResourceFiltering(t *testing.T) {
+	tests := []struct {
+		name         string
+		backup       *velerov1.Backup
+		apiResources []*test.APIResource
+		want         []string
+		actions      []biav2.BackupItemAction
+	}{
+		{
+			name:   "no namespace-scoped resources + some cluster-scoped resources",
+			backup: defaultBackup().IncludedClusterScopedResources("persistentvolumes").ExcludedNamespaceScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("testing").Result(),
+				),
+			},
+			want: []string{
+				"resources/persistentvolumes/cluster/testing.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/testing.json",
+			},
+		},
+		{
+			name:   "no namespace-scoped resources + all cluster-scoped resources",
+			backup: defaultBackup().IncludedClusterScopedResources("*").ExcludedNamespaceScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/backups.velero.io.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/cluster/test2.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/backups.velero.io.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test2.json",
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + no cluster-scoped resources 1",
+			backup: defaultBackup().ExcludedClusterScopedResources("*").IncludedNamespaces("foo", "zoo").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/namespaces/zoo/raz.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/zoo/raz.json",
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + no cluster-scoped resources 2",
+			backup: defaultBackup().ExcludedClusterScopedResources("*").IncludedNamespaceScopedResources("pods", "deployments").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/namespaces/zoo/raz.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/zoo/raz.json",
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + no cluster-scoped resources 3",
+			backup: defaultBackup().ExcludedClusterScopedResources("*").IncludedNamespaces("foo").IncludedNamespaceScopedResources("pods", "deployments").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + no cluster-scoped resources 4",
+			backup: defaultBackup().ExcludedClusterScopedResources("*").ExcludedNamespaceScopedResources("pods").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + only related cluster-scoped resources 2",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedNamespaceScopedResources("pods", "persistentvolumeclaims").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Volumes(builder.ForVolume("foo").PersistentVolumeClaimSource("test-1").Result()).Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+			},
+			want: []string{
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+			actions: []biav2.BackupItemAction{
+				&pluggableAction{
+					selector: velero.ResourceSelector{IncludedResources: []string{"persistentvolumeclaims"}},
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+						additionalItems := []velero.ResourceIdentifier{
+							{GroupResource: kuberesource.PersistentVolumes, Name: "test1"},
+						}
+
+						return item, additionalItems, "", nil, nil
+					},
+				},
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + only related cluster-scoped resources 3",
+			backup: defaultBackup().IncludedNamespaces("foo").ExcludedNamespaceScopedResources("deployments").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Volumes(builder.ForVolume("foo").PersistentVolumeClaimSource("test-1").Result()).Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+			},
+			want: []string{
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+			actions: []biav2.BackupItemAction{
+				&pluggableAction{
+					selector: velero.ResourceSelector{IncludedResources: []string{"persistentvolumeclaims"}},
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+						additionalItems := []velero.ResourceIdentifier{
+							{GroupResource: kuberesource.PersistentVolumes, Name: "test1"},
+						}
+
+						return item, additionalItems, "", nil, nil
+					},
+				},
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + some additional cluster-scoped resources 1",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedClusterScopedResources("customresourcedefinitions").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/backups.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/backups.velero.io.json",
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+			actions: []biav2.BackupItemAction{
+				&pluggableAction{
+					selector: velero.ResourceSelector{IncludedResources: []string{"persistentvolumeclaims"}},
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+						additionalItems := []velero.ResourceIdentifier{
+							{GroupResource: kuberesource.PersistentVolumes, Name: "test1"},
+						}
+
+						return item, additionalItems, "", nil, nil
+					},
+				},
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + some additional cluster-scoped resources 2",
+			backup: defaultBackup().IncludedNamespaceScopedResources("persistentvolumeclaims").IncludedClusterScopedResources("customresourcedefinitions").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/backups.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/backups.velero.io.json",
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+			},
+			actions: []biav2.BackupItemAction{
+				&pluggableAction{
+					selector: velero.ResourceSelector{IncludedResources: []string{"persistentvolumeclaims"}},
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+						additionalItems := []velero.ResourceIdentifier{
+							{GroupResource: kuberesource.PersistentVolumes, Name: "test1"},
+						}
+
+						return item, additionalItems, "", nil, nil
+					},
+				},
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + some additional cluster-scoped resources 3",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedNamespaceScopedResources("pods", "persistentvolumeclaims").IncludedClusterScopedResources("customresourcedefinitions").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/backups.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/backups.velero.io.json",
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+			actions: []biav2.BackupItemAction{
+				&pluggableAction{
+					selector: velero.ResourceSelector{IncludedResources: []string{"persistentvolumeclaims"}},
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+						additionalItems := []velero.ResourceIdentifier{
+							{GroupResource: kuberesource.PersistentVolumes, Name: "test1"},
+						}
+
+						return item, additionalItems, "", nil, nil
+					},
+				},
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + some additional cluster-scoped resources 4",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedNamespaceScopedResources("pods", "persistentvolumeclaims").IncludedClusterScopedResources("*").ExcludedClusterScopedResources("customresourcedefinitions.apiextensions.k8s.io").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/cluster/test2.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test2.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+			actions: []biav2.BackupItemAction{
+				&pluggableAction{
+					selector: velero.ResourceSelector{IncludedResources: []string{"persistentvolumeclaims"}},
+					executeFunc: func(item runtime.Unstructured, backup *velerov1.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+						additionalItems := []velero.ResourceIdentifier{
+							{GroupResource: kuberesource.PersistentVolumes, Name: "test1"},
+						}
+
+						return item, additionalItems, "", nil, nil
+					},
+				},
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + all cluster-scoped resources 1",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedClusterScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVCs(
+					builder.ForPersistentVolumeClaim("foo", "test-1").VolumeName("test1").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+			},
+			want: []string{
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/persistentvolumeclaims/namespaces/foo/test-1.json",
+				"resources/persistentvolumeclaims/v1-preferredversion/namespaces/foo/test-1.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/persistentvolumes/cluster/test2.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test2.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + all cluster-scoped resources 2",
+			backup: defaultBackup().IncludedNamespaceScopedResources("pods").IncludedClusterScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/backups.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/backups.velero.io.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/cluster/test2.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test2.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/namespaces/zoo/raz.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/zoo/raz.json",
+			},
+		},
+		{
+			name:   "some namespace-scoped resources + all cluster-scoped resources 3",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedNamespaceScopedResources("pods").IncludedClusterScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/backups.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/backups.velero.io.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/cluster/test2.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test2.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
+		{
+			name:   "all namespace-scoped resources + no cluster-scoped resources",
+			backup: defaultBackup().ExcludedClusterScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/namespaces/zoo/raz.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/zoo/raz.json",
+			},
+		},
+		{
+			name:   "all namespace-scoped resources + all cluster-scoped resources",
+			backup: defaultBackup().IncludedClusterScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Pods(
+					builder.ForPod("foo", "bar").Result(),
+					builder.ForPod("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("test1").Result(),
+					builder.ForPersistentVolume("test2").Result(),
+				),
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/backups.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/backups.velero.io.json",
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/persistentvolumes/cluster/test1.json",
+				"resources/persistentvolumes/cluster/test2.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test1.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/test2.json",
+				"resources/pods/namespaces/foo/bar.json",
+				"resources/pods/namespaces/zoo/raz.json",
+				"resources/pods/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/pods/v1-preferredversion/namespaces/zoo/raz.json",
+			},
+		},
+		{
+			name:   "namespace resource should be included even it's not specified in the include list, when IncludedNamespaces has specified value 1",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedNamespaceScopedResources("Secrets").Result(),
+			apiResources: []*test.APIResource{
+				test.Secrets(
+					builder.ForSecret("foo", "bar").Result(),
+					builder.ForSecret("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("foo").Result(),
+				),
+				test.Namespaces(
+					builder.ForNamespace("foo").Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/foo.json",
+				"resources/namespaces/v1-preferredversion/cluster/foo.json",
+				"resources/secrets/namespaces/foo/bar.json",
+				"resources/secrets/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
+		{
+			name:   "namespace resource should be included even it's not specified in the include list, when IncludedNamespaces has specified value 2",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedClusterScopedResources("persistentvolumes").Result(),
+			apiResources: []*test.APIResource{
+				test.Secrets(
+					builder.ForSecret("foo", "bar").Result(),
+					builder.ForSecret("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("foo").Result(),
+				),
+				test.Namespaces(
+					builder.ForNamespace("foo").Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/foo.json",
+				"resources/namespaces/v1-preferredversion/cluster/foo.json",
+				"resources/secrets/namespaces/foo/bar.json",
+				"resources/secrets/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/persistentvolumes/cluster/foo.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/foo.json",
+			},
+		},
+		{
+			name:   "namespace resource should be included even it's not specified in the include list, when IncludedNamespaces is asterisk.",
+			backup: defaultBackup().IncludedNamespaces("*").IncludedClusterScopedResources("persistentvolumes").Result(),
+			apiResources: []*test.APIResource{
+				test.Secrets(
+					builder.ForSecret("foo", "bar").Result(),
+					builder.ForSecret("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("foo").Result(),
+				),
+				test.Namespaces(
+					builder.ForNamespace("foo").Result(),
+					builder.ForNamespace("zoo").Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/foo.json",
+				"resources/namespaces/v1-preferredversion/cluster/foo.json",
+				"resources/namespaces/cluster/zoo.json",
+				"resources/namespaces/v1-preferredversion/cluster/zoo.json",
+				"resources/secrets/namespaces/foo/bar.json",
+				"resources/secrets/namespaces/zoo/raz.json",
+				"resources/secrets/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/secrets/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/persistentvolumes/cluster/foo.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/foo.json",
+			},
+		},
+		{
+			name:   "when all namespace-scoped resources are involved, cluster-scoped resources should be included too",
+			backup: defaultBackup().IncludedNamespaces("*").IncludedNamespaceScopedResources("*").Result(),
+			apiResources: []*test.APIResource{
+				test.Secrets(
+					builder.ForSecret("foo", "bar").Result(),
+					builder.ForSecret("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("foo").Result(),
+					builder.ForPersistentVolume("bar").Result(),
+				),
+				test.Namespaces(
+					builder.ForNamespace("foo").Result(),
+					builder.ForNamespace("zoo").Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/foo.json",
+				"resources/namespaces/v1-preferredversion/cluster/foo.json",
+				"resources/namespaces/cluster/zoo.json",
+				"resources/namespaces/v1-preferredversion/cluster/zoo.json",
+				"resources/secrets/namespaces/foo/bar.json",
+				"resources/secrets/namespaces/zoo/raz.json",
+				"resources/secrets/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/secrets/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/deployments.apps/namespaces/foo/bar.json",
+				"resources/deployments.apps/namespaces/zoo/raz.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/zoo/raz.json",
+				"resources/persistentvolumes/cluster/foo.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/foo.json",
+				"resources/persistentvolumes/cluster/bar.json",
+				"resources/persistentvolumes/v1-preferredversion/cluster/bar.json",
+			},
+		},
+		{
+			name:   "IncludedNamespaces is asterisk, but not all namespace-scoped resource types are include, additional cluster-scoped resources should not be included.",
+			backup: defaultBackup().IncludedNamespaces("*").IncludedNamespaceScopedResources("secrets").Result(),
+			apiResources: []*test.APIResource{
+				test.Secrets(
+					builder.ForSecret("foo", "bar").Result(),
+					builder.ForSecret("zoo", "raz").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("foo", "bar").Result(),
+					builder.ForDeployment("zoo", "raz").Result(),
+				),
+				test.PVs(
+					builder.ForPersistentVolume("foo").Result(),
+					builder.ForPersistentVolume("bar").Result(),
+				),
+				test.Namespaces(
+					builder.ForNamespace("foo").Result(),
+					builder.ForNamespace("zoo").Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/foo.json",
+				"resources/namespaces/v1-preferredversion/cluster/foo.json",
+				"resources/namespaces/cluster/zoo.json",
+				"resources/namespaces/v1-preferredversion/cluster/zoo.json",
+				"resources/secrets/namespaces/foo/bar.json",
+				"resources/secrets/namespaces/zoo/raz.json",
+				"resources/secrets/v1-preferredversion/namespaces/foo/bar.json",
+				"resources/secrets/v1-preferredversion/namespaces/zoo/raz.json",
+			},
+		},
+		{
+			name:   "Resource's CRD should be included",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedNamespaceScopedResources("volumesnapshotlocations.velero.io", "backups.velero.io").Result(),
+			apiResources: []*test.APIResource{
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("volumesnapshotlocations.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("test.velero.io").Result(),
+				),
+				test.VSLs(
+					builder.ForVolumeSnapshotLocation("foo", "bar").Result(),
+				),
+				test.Backups(
+					builder.ForBackup("zoo", "raz").Result(),
+				),
+			},
+			want: []string{
+				"resources/customresourcedefinitions.apiextensions.k8s.io/cluster/volumesnapshotlocations.velero.io.json",
+				"resources/customresourcedefinitions.apiextensions.k8s.io/v1beta1-preferredversion/cluster/volumesnapshotlocations.velero.io.json",
+				"resources/volumesnapshotlocations.velero.io/namespaces/foo/bar.json",
+				"resources/volumesnapshotlocations.velero.io/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
+		{
+			name:   "Resource's CRD is not included, when CRD is excluded.",
+			backup: defaultBackup().IncludedNamespaces("foo").IncludedNamespaceScopedResources("volumesnapshotlocations.velero.io", "backups.velero.io").ExcludedClusterScopedResources("customresourcedefinitions.apiextensions.k8s.io").Result(),
+			apiResources: []*test.APIResource{
+				test.CRDs(
+					builder.ForCustomResourceDefinitionV1Beta1("backups.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("volumesnapshotlocations.velero.io").Result(),
+					builder.ForCustomResourceDefinitionV1Beta1("test.velero.io").Result(),
+				),
+				test.VSLs(
+					builder.ForVolumeSnapshotLocation("foo", "bar").Result(),
+				),
+				test.Backups(
+					builder.ForBackup("zoo", "raz").Result(),
+				),
+			},
+			want: []string{
+				"resources/volumesnapshotlocations.velero.io/namespaces/foo/bar.json",
+				"resources/volumesnapshotlocations.velero.io/v1-preferredversion/namespaces/foo/bar.json",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
+				backupFile = bytes.NewBuffer([]byte{})
+			)
+
+			for _, resource := range tc.apiResources {
+				h.addItems(t, resource)
+			}
+
+			h.backupper.Backup(h.log, req, backupFile, tc.actions, nil)
+
+			assertTarballContents(t, backupFile, append(tc.want, "metadata/version")...)
+		})
+	}
+}
+
+func TestBackupNamespaces(t *testing.T) {
+	tests := []struct {
+		name         string
+		backup       *velerov1.Backup
+		apiResources []*test.APIResource
+		want         []string
+	}{
+		{
+			name: "LabelSelector test",
+			backup: defaultBackup().LabelSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"a": "b"}}).
+				Result(),
+			apiResources: []*test.APIResource{
+				test.Namespaces(
+					builder.ForNamespace("ns-1").Result(),
+					builder.ForNamespace("ns-2").Result(),
+					builder.ForNamespace("ns-3").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("ns-1", "deploy-1").ObjectMeta(builder.WithLabels("a", "b")).Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/ns-1.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-1.json",
+				"resources/deployments.apps/namespaces/ns-1/deploy-1.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/ns-1/deploy-1.json",
+				"resources/namespaces/cluster/ns-2.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-2.json",
+				"resources/namespaces/cluster/ns-3.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-3.json",
+			},
+		},
+		{
+			name: "OrLabelSelector test",
+			backup: defaultBackup().OrLabelSelector([]*metav1.LabelSelector{
+				{MatchLabels: map[string]string{"a": "b"}},
+				{MatchLabels: map[string]string{"c": "d"}},
+			}).
+				Result(),
+			apiResources: []*test.APIResource{
+				test.Namespaces(
+					builder.ForNamespace("ns-1").Result(),
+					builder.ForNamespace("ns-2").Result(),
+					builder.ForNamespace("ns-3").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("ns-1", "deploy-1").ObjectMeta(builder.WithLabels("a", "b")).Result(),
+					builder.ForDeployment("ns-2", "deploy-2").ObjectMeta(builder.WithLabels("c", "d")).Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/ns-1.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-1.json",
+				"resources/namespaces/cluster/ns-2.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-2.json",
+				"resources/namespaces/cluster/ns-3.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-3.json",
+				"resources/deployments.apps/namespaces/ns-1/deploy-1.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/ns-1/deploy-1.json",
+				"resources/deployments.apps/namespaces/ns-2/deploy-2.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/ns-2/deploy-2.json",
+			},
+		},
+		{
+			name: "LabelSelector and Namespace filtering test",
+			backup: defaultBackup().IncludedNamespaces("ns-1").LabelSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"a": "b"}}).
+				Result(),
+			apiResources: []*test.APIResource{
+				test.Namespaces(
+					builder.ForNamespace("ns-1").Result(),
+					builder.ForNamespace("ns-2").Result(),
+					builder.ForNamespace("ns-3").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("ns-1", "deploy-1").ObjectMeta(builder.WithLabels("a", "b")).Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/ns-1.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-1.json",
+				"resources/deployments.apps/namespaces/ns-1/deploy-1.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/ns-1/deploy-1.json",
+			},
+		},
+		{
+			name:   "Empty namespace test",
+			backup: defaultBackup().IncludedNamespaces("invalid*").Result(),
+			apiResources: []*test.APIResource{
+				test.Namespaces(
+					builder.ForNamespace("ns-1").Result(),
+					builder.ForNamespace("ns-2").Result(),
+					builder.ForNamespace("ns-3").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("ns-1", "deploy-1").ObjectMeta(builder.WithLabels("a", "b")).Result(),
+				),
+			},
+			want: []string{},
+		},
+		{
+			name:   "Default namespace filter test",
+			backup: defaultBackup().Result(),
+			apiResources: []*test.APIResource{
+				test.Namespaces(
+					builder.ForNamespace("ns-1").Result(),
+					builder.ForNamespace("ns-2").Result(),
+					builder.ForNamespace("ns-3").Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("ns-1", "deploy-1").ObjectMeta(builder.WithLabels("a", "b")).Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/ns-1.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-1.json",
+				"resources/namespaces/cluster/ns-2.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-2.json",
+				"resources/namespaces/cluster/ns-3.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-3.json",
+				"resources/deployments.apps/namespaces/ns-1/deploy-1.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/ns-1/deploy-1.json",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				h   = newHarness(t)
+				req = &Request{
+					Backup:           tc.backup,
+					SkippedPVTracker: NewSkipPVTracker(),
+				}
+				backupFile = bytes.NewBuffer([]byte{})
+			)
+
+			for _, resource := range tc.apiResources {
+				h.addItems(t, resource)
+			}
+
+			h.backupper.Backup(h.log, req, backupFile, nil, nil)
+
+			assertTarballContents(t, backupFile, append(tc.want, "metadata/version")...)
+		})
 	}
 }

@@ -21,10 +21,14 @@ import (
 	"io"
 	"sort"
 
+	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/vmware-tanzu/velero/internal/resourcemodifiers"
+	internalVolume "github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
@@ -49,24 +53,43 @@ func resourceKey(obj runtime.Object) string {
 type Request struct {
 	*velerov1api.Restore
 
-	Log              logrus.FieldLogger
-	Backup           *velerov1api.Backup
-	PodVolumeBackups []*velerov1api.PodVolumeBackup
-	VolumeSnapshots  []*volume.Snapshot
-	BackupReader     io.Reader
-	RestoredItems    map[itemKey]string
+	Log                  logrus.FieldLogger
+	Backup               *velerov1api.Backup
+	PodVolumeBackups     []*velerov1api.PodVolumeBackup
+	VolumeSnapshots      []*volume.Snapshot
+	BackupReader         io.Reader
+	RestoredItems        map[itemKey]restoredItemStatus
+	itemOperationsList   *[]*itemoperation.RestoreOperation
+	ResourceModifiers    *resourcemodifiers.ResourceModifiers
+	DisableInformerCache bool
+	CSIVolumeSnapshots   []*snapshotv1api.VolumeSnapshot
+	VolumeInfoMap        map[string]internalVolume.VolumeInfo
+}
+
+type restoredItemStatus struct {
+	action     string
+	itemExists bool
+}
+
+// GetItemOperationsList returns ItemOperationsList, initializing it if necessary
+func (r *Request) GetItemOperationsList() *[]*itemoperation.RestoreOperation {
+	if r.itemOperationsList == nil {
+		list := []*itemoperation.RestoreOperation{}
+		r.itemOperationsList = &list
+	}
+	return r.itemOperationsList
 }
 
 // RestoredResourceList returns the list of restored resources grouped by the API
 // Version and Kind
 func (r *Request) RestoredResourceList() map[string][]string {
 	resources := map[string][]string{}
-	for i, action := range r.RestoredItems {
+	for i, item := range r.RestoredItems {
 		entry := i.name
 		if i.namespace != "" {
 			entry = fmt.Sprintf("%s/%s", i.namespace, i.name)
 		}
-		entry = fmt.Sprintf("%s(%s)", entry, action)
+		entry = fmt.Sprintf("%s(%s)", entry, item.action)
 		resources[i.resource] = append(resources[i.resource], entry)
 	}
 
